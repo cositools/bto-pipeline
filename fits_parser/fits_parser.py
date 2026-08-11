@@ -69,6 +69,10 @@ LC_BTO_ID_OFS = 16
 LC_BINS_START = 17
 LC_BINS_STEP = 2
 LC_NUM_BINS = 29
+LC_TIMESTAMP_START = LC_BINS_START + (LC_NUM_BINS * LC_BINS_STEP)
+LC_TIMESTAMP_LEN = 12
+LC_COUNTER_START = LC_TIMESTAMP_START + LC_TIMESTAMP_LEN
+LC_COUNTER_BLOCK_LEN = 48
 
 # Event packet layout
 EVT_DATA_START = 22
@@ -179,12 +183,13 @@ class ArchiveRouter:
 # 3. PACKET DECODER
 # =============================================================================
 def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
-    if len(ccsds) < 16:
+    if len(ccsds) < 17:  # Changed to 17 so we can safely extract bto_id at offset 16
         return None
 
     pkt_count = int.from_bytes(ccsds[PKT_SEQ_OFS:PKT_SEQ_OFS + PKT_SEQ_LEN], "big") & 0x3FFF
     sec = int.from_bytes(ccsds[PKT_SEC_OFS:PKT_SEC_OFS + PKT_SEC_LEN], "big")
     tks = int.from_bytes(ccsds[PKT_TKS_OFS:PKT_TKS_OFS + PKT_TKS_LEN], "big")
+    bto_id = ccsds[16] # Extract BTO_ID universally for all packet types
 
     packet_frac = float(tks) / 300_000_000.0
     utc_dt = gps_seconds_to_utc(sec, packet_frac)
@@ -195,7 +200,7 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
     packet_met = get_met(utc_dt)
     packet_dwt_24bit = (tks >> 8) & 0xFFFFFF
     
-    base_data = {"apid": apid, "pkt_count": pkt_count, "utc": utc_dt, "met": packet_met}
+    base_data = {"apid": apid, "pkt_count": pkt_count, "utc": utc_dt, "met": packet_met, "bto_id": bto_id}
 
     # ---------------------------------------------------------------------
     # Housekeeping
@@ -204,7 +209,6 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
         if len(ccsds) < (HK_IT_CS_OFS + 2):
             return None
 
-        bto_id = ccsds[HK_BTO_ID_OFS]
         bto_mode = ccsds[HK_MODE_OFS]
         sut_time = int.from_bytes(ccsds[HK_SUT_OFS:HK_SUT_OFS + 4], "big")
         
@@ -346,10 +350,47 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
             for i in range(LC_NUM_BINS)
         ]
 
+        # Extract 100ms Lightcurve Counters 
+        lc_zc_array = [0] * 10
+        lc_up_array = [0] * 10
+        lc_su_array = [0] * 10
+        
+        # Verify the packet is long enough to hold the discriminator block (48 bytes)
+        if len(ccsds) >= (LC_COUNTER_START + LC_COUNTER_BLOCK_LEN):
+            blocks = []
+            for i in range(12):
+                ptr = LC_COUNTER_START + i * 4
+                blocks.append(ccsds[ptr:ptr+4])
+            
+            # The firmware inserts PPS + subsec info every 10 counts.
+            # We identify the subsec block by checking if the 4th byte is 0xFF.
+            time_idx = -1
+            for i, b in enumerate(blocks):
+                if b[3] == 0xFF:
+                    time_idx = i
+                    break
+                    
+            valid_blocks = []
+            if time_idx != -1:
+                # The seconds struct comes directly before the subseconds struct in the ring buffer.
+                sec_idx = (time_idx - 1) % 12
+                for i, b in enumerate(blocks):
+                    if i != time_idx and i != sec_idx:
+                        valid_blocks.append(b)
+            else:
+                valid_blocks = blocks[:10]  # Fallback 
+                
+            for i, b in enumerate(valid_blocks[:10]):
+                lc_zc_array[i] = (b[0] << 8) | b[1]
+                lc_up_array[i] = b[2]
+                lc_su_array[i] = b[3]
+
         base_data.update({
             "type": "LC",
-            "l1a": [{"TIME": packet_met, "PKT_CNT": pkt_count, "COUNT": raw_bins}],
-            "l1b": [{"TIME": packet_met, "PKT_CNT": pkt_count, "COUNT": raw_bins}],
+            "l1a": [{"TIME": packet_met, "PKT_CNT": pkt_count, "BTO_ID": bto_id, "COUNT": raw_bins, 
+                     "LC_ZC_CNT": lc_zc_array, "LC_UP_CNT": lc_up_array, "LC_SU_CNT": lc_su_array}],
+            "l1b": [{"TIME": packet_met, "PKT_CNT": pkt_count, "BTO_ID": bto_id, "COUNT": raw_bins, 
+                     "LC_ZC_CNT": lc_zc_array, "LC_UP_CNT": lc_up_array, "LC_SU_CNT": lc_su_array}],
         })
         return base_data
 
@@ -468,6 +509,7 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
             l1a.append({
                 "TIME": evt_met,
                 "PKT_CNT": pkt_count,
+                "BTO_ID": bto_id,
                 "PHA": pha,
                 "FLAG_SU": flag_su,
                 "FLAG_UP": flag_up,
@@ -479,6 +521,7 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
             l1b.append({
                 "TIME": evt_met,
                 "PKT_CNT": pkt_count,
+                "BTO_ID": bto_id,
                 "PI": pha,
                 "ENERGY": energy_kev,
                 "DEADTIME": raw_deadtime,
@@ -573,7 +616,6 @@ def inject_metadata(hdu, t_start, t_stop, utc_start, utc_stop, is_primary=False,
     header_data = {
         "TELESCOP": ("COSI", "Telescope"),
         "INSTRUME": ("BTO", "Instrument"),
-        "DETNAM": ("BTO1", "Detector name"), 
         "OBS_ID": (obs_id, "Observation ID"),
         "DATE-OBS": (utc_start.strftime("%Y-%m-%dT%H:%M:%S"), "Start"),
         "DATE-END": (utc_stop.strftime("%Y-%m-%dT%H:%M:%S"), "End"),
@@ -625,6 +667,9 @@ def _make_column(name, values):
     elif name == "COUNT":
         fmt = f"{LC_NUM_BINS}J"
         unit = "ct"
+    elif name in ["LC_ZC_CNT", "LC_UP_CNT", "LC_SU_CNT"]:
+        fmt = "10J"
+        unit = "ct"
     elif name in ["PKT_CNT", "BTO_ID", "BTO_MODE", "FSW_VER", "WD_RESET", "RESET_REASON", "FAULT_STATUS", "DET_PWR_STATUS", "ANALOG_STATUS", "FLAG_SU", "FLAG_UP", "FLAG_LD", "FLAG_PSEUDO"]:
         fmt = "1I"
     elif name in ["SUT", "CMD_CNT", "FAIL_CMD_CNT", "CS_ERR_CNT", "HIST_WPTR", "HIST_RPTR",
@@ -645,15 +690,27 @@ def _make_column(name, values):
 
     return fits.Column(name=name, format=fmt, array=arr, unit=unit)
 
+
 def flush_cache_to_disk(cache, tier):
     for path, data in list(cache.items()):
         if not data["rows"]:
             continue
 
         try:
-            rows = sorted(data["rows"], key=lambda r: float(r["TIME"]))
-            first_row = rows[0]
-
+            # Group incoming rows by BTO_ID to segregate det 0 and 1 streams
+            groups = {}
+            for r in data["rows"]:
+                bid = r.get("BTO_ID", 0)
+                if bid not in groups:
+                    groups[bid] = []
+                groups[bid].append(r)
+            
+            # Sort each group by TIME
+            for bid in groups:
+                groups[bid].sort(key=lambda r: float(r["TIME"]))
+            
+            # Determine extension types from the first row of the first group
+            first_row = data["rows"][0]
             if "PI" in first_row or "PHA" in first_row:
                 ext_name, hdu_class = "BTO_EVENT", "EVENT"
             elif "t_ext_raw" in first_row:
@@ -663,77 +720,130 @@ def flush_cache_to_disk(cache, tier):
             else:
                 ext_name, hdu_class = "DATA", "DATA"
 
-            cols = []
-            for k in first_row.keys():
-                if k.startswith("_"): continue
-                values = [r[k] for r in rows]
-                cols.append(_make_column(k, values))
-
-            new_hdu = fits.BinTableHDU.from_columns(cols, name=ext_name)
-
-            t_s = float(rows[0]["TIME"])
-            t_e = float(rows[-1]["TIME"])
-            utc_start = MET_EPOCH + datetime.timedelta(seconds=t_s)
-            utc_stop = MET_EPOCH + datetime.timedelta(seconds=t_e)
-
-            obs_id = utc_start.strftime("%y%m%d") + ("000t" if ext_name == "BTO_EVENT" else "")
-            inject_metadata(new_hdu, t_s, t_e, utc_start, utc_stop, obs_id=obs_id)
-            new_hdu.header.update({"HDUCLAS1": hdu_class, "HDUCLAS2": "ALL"})
-
-            if ext_name == "BTO_EVENT" and tier == "L1b":
-                new_hdu.header.update({"CHANTYPE": "PI", "DETCHANS": MAX_CHANNELS})
-                
-            if ext_name == "BTO_SPECHIST":
-                new_hdu.header.update({"BINTYPE": "LINEAR", "TIMEDEL": 5.0})
-
+            # Global start/stop times for observation and GTI scope
+            global_t_s = min(float(g[0]["TIME"]) for g in groups.values())
+            global_t_e = max(float(g[-1]["TIME"]) for g in groups.values())
+            global_utc_start = MET_EPOCH + datetime.timedelta(seconds=global_t_s)
+            global_utc_stop = MET_EPOCH + datetime.timedelta(seconds=global_t_e)
+            obs_id = make_obs_id(global_utc_start, is_event=(ext_name == "BTO_EVENT"))
+            
             if os.path.exists(path):
-                with fits.open(path, memmap=False) as hdul:
-                    old_data = hdul[1].data
-                    new_tstop = max(hdul[1].header.get("TSTOP", t_e), t_e)
-
-                    new_table = fits.BinTableHDU.from_columns(
-                        hdul[1].columns,
-                        nrows=len(old_data) + len(rows),
-                        name=hdul[1].name,
-                        header=hdul[1].header,
-                    )
-
-                    for col in hdul[1].columns.names:
-                        incoming = np.array([r[col] for r in rows])
-                        new_table.data[col] = np.concatenate([old_data[col], incoming])
-
-                    new_table.header["TSTOP"] = new_tstop
-                    final_hdul = fits.HDUList([hdul[0], new_table])
+                with fits.open(path, mode='update', memmap=False) as hdul:
+                    for bid, rows in groups.items():
+                        detnam = f"BTO{bid}"
+                        
+                        # Find if an HDU with this DETNAM already exists
+                        target_hdu_idx = None
+                        for i, hdu in enumerate(hdul):
+                            if hdu.name == ext_name and hdu.header.get("DETNAM") == detnam:
+                                target_hdu_idx = i
+                                break
+                        
+                        if target_hdu_idx is not None:
+                            # Append to existing HDU
+                            old_data = hdul[target_hdu_idx].data
+                            new_tstop = max(hdul[target_hdu_idx].header.get("TSTOP", global_t_e), float(rows[-1]["TIME"]))
+                            
+                            new_table = fits.BinTableHDU.from_columns(
+                                hdul[target_hdu_idx].columns,
+                                nrows=len(old_data) + len(rows),
+                                name=hdul[target_hdu_idx].name,
+                                header=hdul[target_hdu_idx].header,
+                            )
+                            for col in hdul[target_hdu_idx].columns.names:
+                                incoming = np.array([r[col] for r in rows])
+                                new_table.data[col] = np.concatenate([old_data[col], incoming])
+                            
+                            new_table.header["TSTOP"] = new_tstop
+                            hdul[target_hdu_idx] = new_table
+                        else:
+                            # Create a brand new HDU for this BTO_ID and append to file
+                            cols = []
+                            for k in rows[0].keys():
+                                if k.startswith("_"): continue
+                                values = [r[k] for r in rows]
+                                cols.append(_make_column(k, values))
+                                
+                            new_hdu = fits.BinTableHDU.from_columns(cols, name=ext_name)
+                            t_s = float(rows[0]["TIME"])
+                            t_e = float(rows[-1]["TIME"])
+                            inject_metadata(new_hdu, t_s, t_e, MET_EPOCH + datetime.timedelta(seconds=t_s), MET_EPOCH + datetime.timedelta(seconds=t_e), obs_id=obs_id)
+                            
+                            # Add standard class info + correct EXTVER/DETNAM mapping
+                            new_hdu.header.update({
+                                "HDUCLAS1": hdu_class, 
+                                "HDUCLAS2": "ALL", 
+                                "DETNAM": detnam,
+                                "EXTVER": bid + 1
+                            })
+                            
+                            if ext_name == "BTO_EVENT" and tier == "L1b":
+                                new_hdu.header.update({"CHANTYPE": "PI", "DETCHANS": MAX_CHANNELS})
+                            if ext_name == "BTO_SPECHIST":
+                                new_hdu.header.update({"BINTYPE": "LINEAR", "TIMEDEL": 1.0}) # Updated from 5.0 to 1.0 cadence
+                                
+                            hdul.append(new_hdu)
                     
-                    # Carry over any additional extensions (GTI, EBOUNDS, etc.)
-                    for ext in hdul[2:]:
-                        ext_copy = ext.copy()
-                        if ext_copy.name == "GTI":
-                            if len(ext_copy.data) > 0:
-                                ext_copy.data["STOP"][-1] = max(ext_copy.data["STOP"][-1], t_e)
-                        final_hdul.append(ext_copy)
-
-                    final_hdul[0].header["DATE-END"] = utc_stop.strftime("%Y-%m-%dT%H:%M:%S")
-                    final_hdul.writeto(path + ".tmp", overwrite=True, checksum=True)
-
-                os.replace(path + ".tmp", path)
+                    # Update global GTI stop threshold
+                    gti_idx = None
+                    for i, hdu in enumerate(hdul):
+                        if hdu.name == "GTI":
+                            gti_idx = i
+                            break
+                    if gti_idx is not None:
+                        gti_hdu = hdul[gti_idx]
+                        if len(gti_hdu.data) > 0:
+                            gti_hdu.data["STOP"][-1] = max(gti_hdu.data["STOP"][-1], global_t_e)
+                    
+                    hdul[0].header["DATE-END"] = global_utc_stop.strftime("%Y-%m-%dT%H:%M:%S")
+                    hdul.flush()
             else:
-                hdul = [fits.PrimaryHDU(), new_hdu]
+                # Create entirely new FITS file
+                hdul_list = [fits.PrimaryHDU()]
+                inject_metadata(hdul_list[0], global_t_s, global_t_e, global_utc_start, global_utc_stop, is_primary=True, obs_id=obs_id)
                 
+                for bid, rows in groups.items():
+                    detnam = f"BTO{bid}"
+                    cols = []
+                    for k in rows[0].keys():
+                        if k.startswith("_"): continue
+                        values = [r[k] for r in rows]
+                        cols.append(_make_column(k, values))
+                        
+                    new_hdu = fits.BinTableHDU.from_columns(cols, name=ext_name)
+                    t_s = float(rows[0]["TIME"])
+                    t_e = float(rows[-1]["TIME"])
+                    inject_metadata(new_hdu, t_s, t_e, MET_EPOCH + datetime.timedelta(seconds=t_s), MET_EPOCH + datetime.timedelta(seconds=t_e), obs_id=obs_id)
+                    
+                    new_hdu.header.update({
+                        "HDUCLAS1": hdu_class, 
+                        "HDUCLAS2": "ALL", 
+                        "DETNAM": detnam,
+                        "EXTVER": bid + 1
+                    })
+                    
+                    if ext_name == "BTO_EVENT" and tier == "L1b":
+                        new_hdu.header.update({"CHANTYPE": "PI", "DETCHANS": MAX_CHANNELS})
+                    if ext_name == "BTO_SPECHIST":
+                        new_hdu.header.update({"BINTYPE": "LINEAR", "TIMEDEL": 1.0}) # Updated from 5.0 to 1.0 cadence
+                        
+                    hdul_list.append(new_hdu)
+                    
                 if ext_name in ["BTO_EVENT", "BTO_SPECHIST", "HK"]:
-                    hdul.append(get_gti_hdu(t_s, t_e))
+                    hdul_list.append(get_gti_hdu(global_t_s, global_t_e))
                 
                 if tier == "L1b":
-                    if "PI" in first_row:
-                        hdul.append(get_ebounds_hdu())
-                    elif "COUNT" in first_row:
-                        hdul.append(get_eneband_hdu())
+                    if ext_name == "BTO_EVENT":
+                        hdul_list.append(get_ebounds_hdu())
+                    elif ext_name == "BTO_SPECHIST":
+                        hdul_list.append(get_eneband_hdu())
 
-                inject_metadata(hdul[0], t_s, t_e, utc_start, utc_stop, is_primary=True, obs_id=obs_id)
-                fits.HDUList(hdul).writeto(path, overwrite=True, checksum=True)
+                fits.HDUList(hdul_list).writeto(path, overwrite=True, checksum=True)
 
-            print(f"[DISK IO] {tier} Flushed {len(rows)} rows to {os.path.basename(path)}")
+            print(f"[DISK IO] {tier} Flushed {len(data['rows'])} rows to {os.path.basename(path)}")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"[ERROR] {e}")
 
         del cache[path]
