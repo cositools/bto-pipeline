@@ -11,6 +11,7 @@ import datetime
 import glob
 import os
 import re
+import tempfile
 import time
 
 import numpy as np
@@ -73,6 +74,9 @@ LC_TIMESTAMP_START = LC_BINS_START + (LC_NUM_BINS * LC_BINS_STEP)
 LC_TIMESTAMP_LEN = 12
 LC_COUNTER_START = LC_TIMESTAMP_START + LC_TIMESTAMP_LEN
 LC_COUNTER_BLOCK_LEN = 48
+LC_TIMEDEL = 1.0  # Each detector accumulates one histogram per second.
+PPS_TICKS_PER_SECOND = 40_000_000.0
+LC_HDU_NAMES = {0: "BTO0_RATES", 1: "BTO1_RATES"}
 
 # Event packet layout
 EVT_DATA_START = 22
@@ -191,7 +195,7 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
     tks = int.from_bytes(ccsds[PKT_TKS_OFS:PKT_TKS_OFS + PKT_TKS_LEN], "big")
     bto_id = ccsds[16] # Extract BTO_ID universally for all packet types
 
-    packet_frac = float(tks) / 300_000_000.0
+    packet_frac = float(tks) / PPS_TICKS_PER_SECOND
     utc_dt = gps_seconds_to_utc(sec, packet_frac)
 
     if utc_dt < MIN_VALID_UTC or utc_dt > MAX_VALID_UTC:
@@ -206,7 +210,14 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
     # Housekeeping
     # ---------------------------------------------------------------------
     if apid == 0x0D8:
-        if len(ccsds) < (HK_IT_CS_OFS + 2):
+        # CCSDS length covers the packet body, excluding the outer IT
+        # checksum. GSE text logs contain just that body (normally 92 bytes),
+        # while a complete wire packet has two more bytes. The last sensor
+        # ends at byte 89; bytes 90..91 are an optional spare, not a checksum.
+        hk_body_len = int.from_bytes(ccsds[PKT_LEN_OFS:PKT_LEN_OFS + PKT_LEN_LEN], "big") + 9
+        if hk_body_len not in (HK_SPARE_OFS, HK_SPARE_OFS + 2):
+            return None
+        if len(ccsds) not in (hk_body_len, hk_body_len + 2):
             return None
 
         bto_mode = ccsds[HK_MODE_OFS]
@@ -246,8 +257,12 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
         vmon_m12_2_raw = int.from_bytes(ccsds[HK_VMON_M12_2_OFS:HK_VMON_M12_2_OFS + 2], "big")
         imon_5v_1_raw = int.from_bytes(ccsds[HK_IMON_5V_1_OFS:HK_IMON_5V_1_OFS + 2], "big")
         imon_5v_2_raw = int.from_bytes(ccsds[HK_IMON_5V_2_OFS:HK_IMON_5V_2_OFS + 2], "big")
-        spare_raw = int.from_bytes(ccsds[HK_SPARE_OFS:HK_SPARE_OFS + 2], "big")
-        it_cs_raw = int.from_bytes(ccsds[HK_IT_CS_OFS:HK_IT_CS_OFS + 2], "big")
+        # -1 explicitly represents a field absent from the input. Do not
+        # report an omitted checksum as zero or read the spare as a checksum.
+        spare_raw = (int.from_bytes(ccsds[HK_SPARE_OFS:HK_SPARE_OFS + 2], "big")
+                     if hk_body_len == HK_SPARE_OFS + 2 else -1)
+        it_cs_raw = (int.from_bytes(ccsds[hk_body_len:hk_body_len + 2], "big")
+                     if len(ccsds) == hk_body_len + 2 else -1)
 
         base_data.update({
             "type": "HK",
@@ -339,8 +354,26 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
     # Lightcurve / histogram
     # ---------------------------------------------------------------------
     elif apid == 0x0D6:
-        if len(ccsds) < (LC_BINS_START + (LC_NUM_BINS * LC_BINS_STEP)):
+        if len(ccsds) < LC_TIMESTAMP_START + LC_TIMESTAMP_LEN:
             return None
+        if bto_id not in LC_HDU_NAMES:
+            return None
+
+        # Bytes 75..78 are deadtime, 79..82 observation PPS seconds,
+        # 83..86 observation ticks. Transmission time is not histogram time:
+        # buffered histograms may be downloaded in a burst much later.
+        obs_sec = int.from_bytes(ccsds[LC_TIMESTAMP_START + 4:LC_TIMESTAMP_START + 8], "big")
+        obs_ticks = int.from_bytes(ccsds[LC_TIMESTAMP_START + 8:LC_TIMESTAMP_START + 12], "big")
+        obs_utc = gps_seconds_to_utc(obs_sec, obs_ticks / PPS_TICKS_PER_SECOND)
+        valid_obs_time = (obs_ticks < PPS_TICKS_PER_SECOND
+                          and MIN_VALID_UTC <= obs_utc <= MAX_VALID_UTC)
+        # Startup histograms can predate PPS synchronization. Retain their
+        # counts, flag the transmission-time fallback, and keep raw fields.
+        if not valid_obs_time:
+            obs_utc = utc_dt
+        obs_met = get_met(obs_utc)
+        time_fields = {"TIME_QUAL": 0 if valid_obs_time else 1,
+                       "HIST_SEC": obs_sec, "HIST_TICKS": obs_ticks}
 
         raw_bins = [
             int.from_bytes(
@@ -387,9 +420,12 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
 
         base_data.update({
             "type": "LC",
-            "l1a": [{"TIME": packet_met, "PKT_CNT": pkt_count, "BTO_ID": bto_id, "COUNT": raw_bins, 
+            "obs_utc": obs_utc,
+            "l1a": [{"TIME": obs_met, "PKT_CNT": pkt_count, "BTO_ID": bto_id, "COUNT": raw_bins,
+                     **time_fields,
                      "LC_ZC_CNT": lc_zc_array, "LC_UP_CNT": lc_up_array, "LC_SU_CNT": lc_su_array}],
-            "l1b": [{"TIME": packet_met, "PKT_CNT": pkt_count, "BTO_ID": bto_id, "COUNT": raw_bins, 
+            "l1b": [{"TIME": obs_met, "PKT_CNT": pkt_count, "BTO_ID": bto_id, "COUNT": raw_bins,
+                     **time_fields,
                      "LC_ZC_CNT": lc_zc_array, "LC_UP_CNT": lc_up_array, "LC_SU_CNT": lc_su_array}],
         })
         return base_data
@@ -624,13 +660,13 @@ def inject_metadata(hdu, t_start, t_stop, utc_start, utc_stop, is_primary=False,
         "SEQNUM": (1, "Times dataset has been processed"),
         "TLM2FITS": ("BTO_PIPELINE", "Telemetry converter"),
         "CALDBVER": (caldb_ver, "CALDB version"),
-        "PROCVER": ("01.00.00", "Processing version"),
+        "PROCVER": ("01.00.02", "Processing version"),
         "OBSERVER": ("John Tomsick", "Principal Investigator")
     }
 
     if is_primary:
         header_data.update({
-            "CREATOR": ("BTO_LIVE_V5.24", "Software"),
+            "CREATOR": ("BTO_LIVE_V5.26", "Software"),
         })
     else:
         header_data.update({
@@ -667,6 +703,8 @@ def _make_column(name, values):
     elif name == "COUNT":
         fmt = f"{LC_NUM_BINS}J"
         unit = "ct"
+    elif name in ["HIST_SEC", "HIST_TICKS"]:
+        fmt = "1K"  # unsigned uint32 telemetry plus -1 for unknown legacy data
     elif name in ["LC_ZC_CNT", "LC_UP_CNT", "LC_SU_CNT"]:
         fmt = "10J"
         unit = "ct"
@@ -691,9 +729,110 @@ def _make_column(name, values):
     return fits.Column(name=name, format=fmt, array=arr, unit=unit)
 
 
+def _flush_lightcurve(path, incoming, tier):
+    """Write one histogram extension per detector, including on later flushes.
+
+    A legacy merged table can be split only if its rows retain BTO_ID. DETNAM
+    alone is insufficient evidence: issue #9 reports mislabeled mixed tables.
+    """
+    names = [name for name in incoming[0] if not name.startswith("_")]
+    if "BTO_ID" not in names:
+        raise ValueError("Lightcurve rows require BTO_ID; cannot infer a detector")
+    rows = []
+    primary = fits.PrimaryHDU()
+    auxiliary = []
+    if os.path.exists(path):
+        with fits.open(path, memmap=False) as old:
+            primary = old[0].copy()
+            for hdu in old[1:]:
+                if hdu.name in ("BTO_SPECHIST", *LC_HDU_NAMES.values()):
+                    if "BTO_ID" not in hdu.columns.names:
+                        raise ValueError(
+                            f"{path}: existing lightcurve has no per-row BTO_ID. "
+                            "Regenerate it from the raw log in a fresh archive; "
+                            "its DETNAM header cannot identify mixed detector rows."
+                        )
+                    legacy_defaults = {"TIME_QUAL": 2, "HIST_SEC": -1, "HIST_TICKS": -1}
+                    old_names = set(hdu.columns.names)
+                    if (old_names - set(names)
+                            or set(names) - old_names - set(legacy_defaults)):
+                        raise ValueError(f"{path}: incompatible lightcurve columns; regenerate from raw logs")
+                    rows.extend({name: row[name] if name in old_names else legacy_defaults[name]
+                                 for name in names} for row in hdu.data)
+                elif hdu.name != "GTI":
+                    auxiliary.append(hdu.copy())
+    rows.extend(incoming)
+    groups = {bid: [] for bid in LC_HDU_NAMES}
+    for row in rows:
+        bid = row["BTO_ID"]
+        if bid not in groups:
+            raise ValueError(f"Invalid lightcurve BTO_ID: {bid!r}; expected 0 or 1")
+        groups[bid].append(row)
+    for group in groups.values():
+        group.sort(key=lambda row: float(row["TIME"]))
+
+    t_start = min(float(row["TIME"]) for row in rows)
+    t_stop = max(float(row["TIME"]) for row in rows)
+    utc_start = MET_EPOCH + datetime.timedelta(seconds=t_start)
+    utc_stop = MET_EPOCH + datetime.timedelta(seconds=t_stop)
+    obs_id = make_obs_id(utc_start, is_event=False)
+    inject_metadata(primary, t_start, t_stop, utc_start, utc_stop, is_primary=True, obs_id=obs_id)
+    primary.header["TSTART"] = t_start
+    primary.header["TSTOP"] = t_stop
+    hdus = [primary]
+    for bid, group in groups.items():
+        columns = [_make_column(name, [row[name] for row in group]) for name in names]
+        hdu = fits.BinTableHDU.from_columns(columns, name=LC_HDU_NAMES[bid])
+        start = float(group[0]["TIME"]) if group else t_start
+        stop = float(group[-1]["TIME"]) if group else t_stop
+        inject_metadata(hdu, start, stop,
+                        MET_EPOCH + datetime.timedelta(seconds=start),
+                        MET_EPOCH + datetime.timedelta(seconds=stop), obs_id=obs_id)
+        hdu.header.update({
+            "INSTRUME": f"BTO{bid}", "DETNAM": f"BTO{bid}", "BTO_ID": bid,
+            "EXTVER": bid + 1, "TIMEDEL": LC_TIMEDEL,
+            "HDUCLAS1": "TEMPORALDATA", "HDUCLAS2": "EVRATE",
+            "TQDEF": "0=observation; 1=packet fallback; 2=legacy unknown",
+            "NUNCORR": sum(row.get("TIME_QUAL", 2) != 0 for row in group),
+        })
+        if not group:
+            # Keep the workbook's two-detector layout without inventing rows
+            # or assigning the other detector's observation bounds.
+            for keyword in ("TSTART", "TSTOP", "DATE-OBS", "DATE-END"):
+                del hdu.header[keyword]
+        hdus.append(hdu)
+
+    gti = get_gti_hdu(t_start, t_stop)
+    inject_metadata(gti, t_start, t_stop, utc_start, utc_stop, obs_id=obs_id)
+    hdus.append(gti)
+    if tier == "L1b" and not any(hdu.name == "ENEBAND" for hdu in auxiliary):
+        auxiliary.append(get_eneband_hdu())
+    hdus.extend(auxiliary)
+
+    # Leave the old file and caller's cache intact if a write fails. Updating
+    # all HDUs together also refreshes their FITS CHECKSUM/DATASUM values.
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".bto-lc-", suffix=".fits", dir=directory)
+    os.close(fd)
+    try:
+        with fits.HDUList(hdus) as output:
+            output.writeto(temporary, overwrite=True, checksum=True, output_verify="exception")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def flush_cache_to_disk(cache, tier):
     for path, data in list(cache.items()):
         if not data["rows"]:
+            continue
+
+        if "COUNT" in data["rows"][0]:
+            _flush_lightcurve(path, data["rows"], tier)
+            print(f"[DISK IO] {tier} Flushed {len(data['rows'])} rows to {os.path.basename(path)}")
+            del cache[path]
             continue
 
         try:
@@ -963,7 +1102,7 @@ def run_pipeline(input_path: str, levels: list, is_live: bool):
                             cache_a[pa]["rows"].append(row)
                             cache_a[pa]["met_list"].append(p["met"])
                     else:
-                        pa = router.get_path("L1a", apid, p["utc"], p.get("tid", 0))
+                        pa = router.get_path("L1a", apid, p.get("obs_utc", p["utc"]), p.get("tid", 0))
                         if pa not in cache_a:
                             cache_a[pa] = {"rows": [], "met_list": []}
                         cache_a[pa]["rows"].extend(p["l1a"])
@@ -978,7 +1117,7 @@ def run_pipeline(input_path: str, levels: list, is_live: bool):
                             cache_b[pb]["rows"].append(row)
                             cache_b[pb]["met_list"].append(p["met"])
                     else:
-                        pb = router.get_path("L1b", apid, p["utc"], p.get("tid", 0))
+                        pb = router.get_path("L1b", apid, p.get("obs_utc", p["utc"]), p.get("tid", 0))
                         if pb not in cache_b:
                             cache_b[pb] = {"rows": [], "met_list": []}
                         cache_b[pb]["rows"].extend(p["l1b"])
