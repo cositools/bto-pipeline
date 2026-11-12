@@ -1,1156 +1,995 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-BTO PIPELINE
-Monitors or batch-processes CCSDS hex logs into L0, L1a, and L1b FITS archives.
+Read BTO binary telemetry and write traceable FITS products.
 
 """
+
+from __future__ import annotations
 
 import argparse
-import datetime
-import glob
-import os
-import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import struct
+import sys
 import tempfile
-import time
 
 import numpy as np
 from astropy.io import fits
-
-# =============================================================================
-# 1. MISSION CONSTANTS & OFFSETS
-# =============================================================================
-GPS_EPOCH = datetime.datetime(1980, 1, 6, 0, 0, 0, tzinfo=datetime.timezone.utc)
-MET_EPOCH = datetime.datetime(2025, 1, 1, 0, 0, 0, tzinfo=datetime.timezone.utc)
-
-GPS_UTC_LEAP_SECONDS = [
-    (datetime.datetime(1981, 7, 1, tzinfo=datetime.timezone.utc), 1),
-    (datetime.datetime(1982, 7, 1, tzinfo=datetime.timezone.utc), 2),
-    (datetime.datetime(1983, 7, 1, tzinfo=datetime.timezone.utc), 3),
-    (datetime.datetime(1985, 7, 1, tzinfo=datetime.timezone.utc), 4),
-    (datetime.datetime(1988, 1, 1, tzinfo=datetime.timezone.utc), 5),
-    (datetime.datetime(1990, 1, 1, tzinfo=datetime.timezone.utc), 6),
-    (datetime.datetime(1991, 1, 1, tzinfo=datetime.timezone.utc), 7),
-    (datetime.datetime(1992, 7, 1, tzinfo=datetime.timezone.utc), 8),
-    (datetime.datetime(1993, 7, 1, tzinfo=datetime.timezone.utc), 9),
-    (datetime.datetime(1994, 7, 1, tzinfo=datetime.timezone.utc), 10),
-    (datetime.datetime(1996, 1, 1, tzinfo=datetime.timezone.utc), 11),
-    (datetime.datetime(1997, 7, 1, tzinfo=datetime.timezone.utc), 12),
-    (datetime.datetime(1999, 1, 1, tzinfo=datetime.timezone.utc), 13),
-    (datetime.datetime(2006, 1, 1, tzinfo=datetime.timezone.utc), 14),
-    (datetime.datetime(2009, 1, 1, tzinfo=datetime.timezone.utc), 15),
-    (datetime.datetime(2012, 7, 1, tzinfo=datetime.timezone.utc), 16),
-    (datetime.datetime(2015, 7, 1, tzinfo=datetime.timezone.utc), 17),
-    (datetime.datetime(2017, 1, 1, tzinfo=datetime.timezone.utc), 18),
-]
-
-DWT_24BIT_TICK_SEC = 853.33 / 1_000_000_000.0
-
-CAL_HK = {
-    "EXT": (0.1022, -275.66),
-    "DET1": (0.1022, -275.66),
-    "DET2": (0.1022, -275.66),
-    "P12": (0.0037, 0.0),
-    "M12": (0.0037, 0.0),
-    "IMON5V": (0.0001665, 0.0),
-}
-
-E_SLOPE, E_INTERCEPT = 0.84098, -1.64736
-MAX_CHANNELS = 4096
-
-# CCSDS primary header offsets after 2-byte sync
-PKT_ID_OFS, PKT_ID_LEN = 2, 2
-PKT_SEQ_OFS, PKT_SEQ_LEN = 4, 2
-PKT_LEN_OFS, PKT_LEN_LEN = 6, 2
-PKT_SEC_OFS, PKT_SEC_LEN = 8, 4
-PKT_TKS_OFS, PKT_TKS_LEN = 12, 4
-
-# Histogram / lightcurve packet layout
-LC_BTO_ID_OFS = 16
-LC_BINS_START = 17
-LC_BINS_STEP = 2
-LC_NUM_BINS = 29
-LC_TIMESTAMP_START = LC_BINS_START + (LC_NUM_BINS * LC_BINS_STEP)
-LC_TIMESTAMP_LEN = 12
-LC_COUNTER_START = LC_TIMESTAMP_START + LC_TIMESTAMP_LEN
-LC_COUNTER_BLOCK_LEN = 48
-LC_TIMEDEL = 1.0  # Each detector accumulates one histogram per second.
-PPS_TICKS_PER_SECOND = 40_000_000.0
-LC_HDU_NAMES = {0: "BTO0_RATES", 1: "BTO1_RATES"}
-
-# Event packet layout
-EVT_DATA_START = 22
-EVT_WORD_LEN = 8
-
-# Housekeeping packet layout
-HK_BTO_ID_OFS = 16
-HK_MODE_OFS = 17
-HK_SUT_OFS = 18
-HK_CMD_CNT_OFS = 22
-HK_FAIL_CMD_CNT_OFS = 24
-HK_CS_ERR_CNT_OFS = 26
-HK_FSW_VER_OFS = 28
-HK_WD_RESET_OFS = 29
-HK_RESET_REASON_OFS = 30
-HK_FAULT_STATUS_OFS = 31
-HK_DET_PWR_STATUS_OFS = 32
-HK_ANALOG_STATUS_OFS = 33
-HK_HIST_WPTR_OFS = 34
-HK_HIST_RPTR_OFS = 36
-HK_HIST_NAND_WPTR_OFS = 38
-HK_HIST_NAND_RPTR_OFS = 42
-HK_PHOT_NAND_WPTR_OFS = 46
-HK_PHOT_NAND_RPTR_OFS = 50
-HK_FLASH_ERASE_FAIL_OFS = 54
-HK_LAST_GRB_TIME_OFS = 56
-HK_LAST_GRB_NAND_OFS = 60
-HK_LAST_GRB_ID_OFS = 64
-HK_ZC_CNT_OFS = 68
-HK_SU_CNT_OFS = 70
-HK_TEMP_EXT_OFS = 72
-HK_TEMP_DET1_OFS = 74
-HK_TEMP_DET2_OFS = 76
-HK_VMON_P12_1_OFS = 78
-HK_VMON_M12_1_OFS = 80
-HK_VMON_P12_2_OFS = 82
-HK_VMON_M12_2_OFS = 84
-HK_IMON_5V_1_OFS = 86
-HK_IMON_5V_2_OFS = 88
-HK_SPARE_OFS = 90
-HK_IT_CS_OFS = 92
-
-FLUSH_THRESHOLD = 1000
-MIN_VALID_UTC = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
-MAX_VALID_UTC = datetime.datetime(2030, 1, 1, tzinfo=datetime.timezone.utc)
-
-# =============================================================================
-# 2. TIME & ROUTING UTILITIES
-# =============================================================================
-def gps_utc_offset_for_utc(dt_utc: datetime.datetime) -> int:
-    offset = 0
-    for effective_utc, leap_count in GPS_UTC_LEAP_SECONDS:
-        if dt_utc >= effective_utc:
-            offset = leap_count
-        else:
-            break
-    return offset
-
-def gps_seconds_to_utc(gps_sec: int, frac_sec: float = 0.0) -> datetime.datetime:
-    gps_dt = GPS_EPOCH + datetime.timedelta(seconds=float(gps_sec) + frac_sec)
-    utc_dt = gps_dt
-    for _ in range(3):
-        offset = gps_utc_offset_for_utc(utc_dt)
-        new_utc_dt = gps_dt - datetime.timedelta(seconds=offset)
-        if new_utc_dt == utc_dt:
-            break
-        utc_dt = new_utc_dt
-    return utc_dt
-
-def get_met(dt_utc: datetime.datetime) -> float:
-    return (dt_utc - MET_EPOCH).total_seconds()
-
-def clean_hex_fragment(text: str) -> str:
-    text = text.split("#", 1)[0]
-    return re.sub(r"[^0-9A-Fa-f]", "", text)
-
-class ArchiveRouter:
-    def __init__(self, root="BTO_Data_Archive"):
-        self.root = root
-
-    def get_path(self, tier: str, apid: int, dt: datetime.datetime, tid: int = 0) -> str:
-        yyyy, mm, dd = dt.strftime("%Y"), dt.strftime("%m"), dt.strftime("%d")
-        yymmdd = dt.strftime("%y%m%d")
-
-        if tier == "L0":
-            folder = {
-                0xD6: "D6_Spectrum",
-                0xD7: "D7_Event_packages",
-                0xD8: "D8_House_keeping",
-            }.get(apid, "Other")
-            base = os.path.join(self.root, "L0_binary", yyyy, mm, dd, folder)
-            fname = f"bto_{yymmdd}_{folder.lower()}.bin"
-        else:
-            base = os.path.join(self.root, f"{tier}_fits", yyyy, mm, dd)
-            if apid == 0xD6:
-                fname = f"cs{yymmdd}bto_lc.fits"
-            elif apid == 0xD8:
-                fname = f"cs{yymmdd}bto_hk.fits"
-            elif apid == 0xD7:
-                fname = f"cs{yymmdd}_{tid:05d}_bto_evt.fits"
-            else:
-                fname = f"cs{yymmdd}_misc.fits"
-
-        os.makedirs(base, exist_ok=True)
-        return os.path.join(base, fname)
-
-# =============================================================================
-# 3. PACKET DECODER
-# =============================================================================
-def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
-    if len(ccsds) < 17:  # Changed to 17 so we can safely extract bto_id at offset 16
-        return None
-
-    pkt_count = int.from_bytes(ccsds[PKT_SEQ_OFS:PKT_SEQ_OFS + PKT_SEQ_LEN], "big") & 0x3FFF
-    sec = int.from_bytes(ccsds[PKT_SEC_OFS:PKT_SEC_OFS + PKT_SEC_LEN], "big")
-    tks = int.from_bytes(ccsds[PKT_TKS_OFS:PKT_TKS_OFS + PKT_TKS_LEN], "big")
-    bto_id = ccsds[16] # Extract BTO_ID universally for all packet types
-
-    packet_frac = float(tks) / PPS_TICKS_PER_SECOND
-    utc_dt = gps_seconds_to_utc(sec, packet_frac)
-
-    if utc_dt < MIN_VALID_UTC or utc_dt > MAX_VALID_UTC:
-        return None
-
-    packet_met = get_met(utc_dt)
-    packet_dwt_24bit = (tks >> 8) & 0xFFFFFF
-    
-    base_data = {"apid": apid, "pkt_count": pkt_count, "utc": utc_dt, "met": packet_met, "bto_id": bto_id}
-
-    # ---------------------------------------------------------------------
-    # Housekeeping
-    # ---------------------------------------------------------------------
-    if apid == 0x0D8:
-        # CCSDS length covers the packet body, excluding the outer IT
-        # checksum. GSE text logs contain just that body (normally 92 bytes),
-        # while a complete wire packet has two more bytes. The last sensor
-        # ends at byte 89; bytes 90..91 are an optional spare, not a checksum.
-        hk_body_len = int.from_bytes(ccsds[PKT_LEN_OFS:PKT_LEN_OFS + PKT_LEN_LEN], "big") + 9
-        if hk_body_len not in (HK_SPARE_OFS, HK_SPARE_OFS + 2):
-            return None
-        if len(ccsds) not in (hk_body_len, hk_body_len + 2):
-            return None
-
-        bto_mode = ccsds[HK_MODE_OFS]
-        sut_time = int.from_bytes(ccsds[HK_SUT_OFS:HK_SUT_OFS + 4], "big")
-        
-        d7_state["hk_sut"] = sut_time
-        
-        cmd_cnt = int.from_bytes(ccsds[HK_CMD_CNT_OFS:HK_CMD_CNT_OFS + 2], "big")
-        fail_cmd_cnt = int.from_bytes(ccsds[HK_FAIL_CMD_CNT_OFS:HK_FAIL_CMD_CNT_OFS + 2], "big")
-        cs_err_cnt = int.from_bytes(ccsds[HK_CS_ERR_CNT_OFS:HK_CS_ERR_CNT_OFS + 2], "big")
-        fsw_ver = ccsds[HK_FSW_VER_OFS]
-        wd_reset = ccsds[HK_WD_RESET_OFS]
-        reset_reason = ccsds[HK_RESET_REASON_OFS]
-        fault_status = ccsds[HK_FAULT_STATUS_OFS]
-        det_pwr_status = ccsds[HK_DET_PWR_STATUS_OFS]
-        analog_status = ccsds[HK_ANALOG_STATUS_OFS]
-
-        hist_wptr = int.from_bytes(ccsds[HK_HIST_WPTR_OFS:HK_HIST_WPTR_OFS + 2], "big")
-        hist_rptr = int.from_bytes(ccsds[HK_HIST_RPTR_OFS:HK_HIST_RPTR_OFS + 2], "big")
-        hist_nand_wptr = int.from_bytes(ccsds[HK_HIST_NAND_WPTR_OFS:HK_HIST_NAND_WPTR_OFS + 4], "big")
-        hist_nand_rptr = int.from_bytes(ccsds[HK_HIST_NAND_RPTR_OFS:HK_HIST_NAND_RPTR_OFS + 4], "big")
-        phot_nand_wptr = int.from_bytes(ccsds[HK_PHOT_NAND_WPTR_OFS:HK_PHOT_NAND_WPTR_OFS + 4], "big")
-        phot_nand_rptr = int.from_bytes(ccsds[HK_PHOT_NAND_RPTR_OFS:HK_PHOT_NAND_RPTR_OFS + 4], "big")
-        flash_erase_fail = int.from_bytes(ccsds[HK_FLASH_ERASE_FAIL_OFS:HK_FLASH_ERASE_FAIL_OFS + 2], "big")
-        last_grb_time = int.from_bytes(ccsds[HK_LAST_GRB_TIME_OFS:HK_LAST_GRB_TIME_OFS + 4], "big")
-        last_grb_nand = int.from_bytes(ccsds[HK_LAST_GRB_NAND_OFS:HK_LAST_GRB_NAND_OFS + 4], "big")
-        last_grb_id = int.from_bytes(ccsds[HK_LAST_GRB_ID_OFS:HK_LAST_GRB_ID_OFS + 4], "big")
-        zc_cnt = int.from_bytes(ccsds[HK_ZC_CNT_OFS:HK_ZC_CNT_OFS + 2], "big")
-        su_cnt = int.from_bytes(ccsds[HK_SU_CNT_OFS:HK_SU_CNT_OFS + 2], "big")
-
-        t_ext_raw = int.from_bytes(ccsds[HK_TEMP_EXT_OFS:HK_TEMP_EXT_OFS + 2], "big")
-        t_det1_raw = int.from_bytes(ccsds[HK_TEMP_DET1_OFS:HK_TEMP_DET1_OFS + 2], "big")
-        t_det2_raw = int.from_bytes(ccsds[HK_TEMP_DET2_OFS:HK_TEMP_DET2_OFS + 2], "big")
-        vmon_p12_1_raw = int.from_bytes(ccsds[HK_VMON_P12_1_OFS:HK_VMON_P12_1_OFS + 2], "big")
-        vmon_m12_1_raw = int.from_bytes(ccsds[HK_VMON_M12_1_OFS:HK_VMON_M12_1_OFS + 2], "big")
-        vmon_p12_2_raw = int.from_bytes(ccsds[HK_VMON_P12_2_OFS:HK_VMON_P12_2_OFS + 2], "big")
-        vmon_m12_2_raw = int.from_bytes(ccsds[HK_VMON_M12_2_OFS:HK_VMON_M12_2_OFS + 2], "big")
-        imon_5v_1_raw = int.from_bytes(ccsds[HK_IMON_5V_1_OFS:HK_IMON_5V_1_OFS + 2], "big")
-        imon_5v_2_raw = int.from_bytes(ccsds[HK_IMON_5V_2_OFS:HK_IMON_5V_2_OFS + 2], "big")
-        # -1 explicitly represents a field absent from the input. Do not
-        # report an omitted checksum as zero or read the spare as a checksum.
-        spare_raw = (int.from_bytes(ccsds[HK_SPARE_OFS:HK_SPARE_OFS + 2], "big")
-                     if hk_body_len == HK_SPARE_OFS + 2 else -1)
-        it_cs_raw = (int.from_bytes(ccsds[hk_body_len:hk_body_len + 2], "big")
-                     if len(ccsds) == hk_body_len + 2 else -1)
-
-        base_data.update({
-            "type": "HK",
-            "l1a": [{
-                "TIME": packet_met,
-                "PKT_CNT": pkt_count,
-                "BTO_ID": bto_id,
-                "BTO_MODE": bto_mode,
-                "SUT": sut_time,
-                "CMD_CNT": cmd_cnt,
-                "FAIL_CMD_CNT": fail_cmd_cnt,
-                "CS_ERR_CNT": cs_err_cnt,
-                "FSW_VER": fsw_ver,
-                "WD_RESET": wd_reset,
-                "RESET_REASON": reset_reason,
-                "FAULT_STATUS": fault_status,
-                "DET_PWR_STATUS": det_pwr_status,
-                "ANALOG_STATUS": analog_status,
-                "HIST_WPTR": hist_wptr,
-                "HIST_RPTR": hist_rptr,
-                "HIST_NAND_WPTR": hist_nand_wptr,
-                "HIST_NAND_RPTR": hist_nand_rptr,
-                "PHOT_NAND_WPTR": phot_nand_wptr,
-                "PHOT_NAND_RPTR": phot_nand_rptr,
-                "FLASH_ERASE_FAIL": flash_erase_fail,
-                "LAST_GRB_TIME": last_grb_time,
-                "LAST_GRB_NAND": last_grb_nand,
-                "LAST_GRB_ID": last_grb_id,
-                "ZC_CNT": zc_cnt,
-                "SU_CNT": su_cnt,
-                "t_ext_raw": t_ext_raw,
-                "t_det1_raw": t_det1_raw,
-                "t_det2_raw": t_det2_raw,
-                "vmon_p12_1_raw": vmon_p12_1_raw,
-                "vmon_m12_1_raw": vmon_m12_1_raw,
-                "vmon_p12_2_raw": vmon_p12_2_raw,
-                "vmon_m12_2_raw": vmon_m12_2_raw,
-                "imon_5v_1_raw": imon_5v_1_raw,
-                "imon_5v_2_raw": imon_5v_2_raw,
-                "spare_raw": spare_raw,
-                "it_cs_raw": it_cs_raw,
-            }],
-            "l1b": [{
-                "TIME": packet_met,
-                "PKT_CNT": pkt_count,
-                "BTO_ID": bto_id,
-                "BTO_MODE": bto_mode,
-                "SUT": sut_time,
-                "CMD_CNT": cmd_cnt,
-                "FAIL_CMD_CNT": fail_cmd_cnt,
-                "CS_ERR_CNT": cs_err_cnt,
-                "FSW_VER": fsw_ver,
-                "WD_RESET": wd_reset,
-                "RESET_REASON": reset_reason,
-                "FAULT_STATUS": fault_status,
-                "DET_PWR_STATUS": det_pwr_status,
-                "ANALOG_STATUS": analog_status,
-                "HIST_WPTR": hist_wptr,
-                "HIST_RPTR": hist_rptr,
-                "HIST_NAND_WPTR": hist_nand_wptr,
-                "HIST_NAND_RPTR": hist_nand_rptr,
-                "PHOT_NAND_WPTR": phot_nand_wptr,
-                "PHOT_NAND_RPTR": phot_nand_rptr,
-                "FLASH_ERASE_FAIL": flash_erase_fail,
-                "LAST_GRB_TIME": last_grb_time,
-                "LAST_GRB_NAND": last_grb_nand,
-                "LAST_GRB_ID": last_grb_id,
-                "ZC_CNT": zc_cnt,
-                "SU_CNT": su_cnt,
-                "t_ext_raw": t_ext_raw,
-                "t_det1_raw": t_det1_raw,
-                "t_det2_raw": t_det2_raw,
-                "vmon_p12_1_raw": vmon_p12_1_raw,
-                "vmon_m12_1_raw": vmon_m12_1_raw,
-                "vmon_p12_2_raw": vmon_p12_2_raw,
-                "vmon_m12_2_raw": vmon_m12_2_raw,
-                "imon_5v_1_raw": imon_5v_1_raw,
-                "imon_5v_2_raw": imon_5v_2_raw,
-                "spare_raw": spare_raw,
-                "it_cs_raw": it_cs_raw,
-                "t_ext": (t_ext_raw * CAL_HK["EXT"][0]) + CAL_HK["EXT"][1],
-                "t_det1": (t_det1_raw * CAL_HK["DET1"][0]) + CAL_HK["DET1"][1],
-                "t_det2": (t_det2_raw * CAL_HK["DET2"][0]) + CAL_HK["DET2"][1],
-            }],
-        })
-        return base_data
-
-    # ---------------------------------------------------------------------
-    # Lightcurve / histogram
-    # ---------------------------------------------------------------------
-    elif apid == 0x0D6:
-        if len(ccsds) < LC_TIMESTAMP_START + LC_TIMESTAMP_LEN:
-            return None
-        if bto_id not in LC_HDU_NAMES:
-            return None
-
-        # Bytes 75..78 are deadtime, 79..82 observation PPS seconds,
-        # 83..86 observation ticks. Transmission time is not histogram time:
-        # buffered histograms may be downloaded in a burst much later.
-        obs_sec = int.from_bytes(ccsds[LC_TIMESTAMP_START + 4:LC_TIMESTAMP_START + 8], "big")
-        obs_ticks = int.from_bytes(ccsds[LC_TIMESTAMP_START + 8:LC_TIMESTAMP_START + 12], "big")
-        obs_utc = gps_seconds_to_utc(obs_sec, obs_ticks / PPS_TICKS_PER_SECOND)
-        valid_obs_time = (obs_ticks < PPS_TICKS_PER_SECOND
-                          and MIN_VALID_UTC <= obs_utc <= MAX_VALID_UTC)
-        # Startup histograms can predate PPS synchronization. Retain their
-        # counts, flag the transmission-time fallback, and keep raw fields.
-        if not valid_obs_time:
-            obs_utc = utc_dt
-        obs_met = get_met(obs_utc)
-        time_fields = {"TIME_QUAL": 0 if valid_obs_time else 1,
-                       "HIST_SEC": obs_sec, "HIST_TICKS": obs_ticks}
-
-        raw_bins = [
-            int.from_bytes(
-                ccsds[LC_BINS_START + (i * LC_BINS_STEP): LC_BINS_START + (i * LC_BINS_STEP) + 2],
-                "big",
-            )
-            for i in range(LC_NUM_BINS)
-        ]
-
-        # Extract 100ms Lightcurve Counters 
-        lc_zc_array = [0] * 10
-        lc_up_array = [0] * 10
-        lc_su_array = [0] * 10
-        
-        # Verify the packet is long enough to hold the discriminator block (48 bytes)
-        if len(ccsds) >= (LC_COUNTER_START + LC_COUNTER_BLOCK_LEN):
-            blocks = []
-            for i in range(12):
-                ptr = LC_COUNTER_START + i * 4
-                blocks.append(ccsds[ptr:ptr+4])
-            
-            # The firmware inserts PPS + subsec info every 10 counts.
-            # We identify the subsec block by checking if the 4th byte is 0xFF.
-            time_idx = -1
-            for i, b in enumerate(blocks):
-                if b[3] == 0xFF:
-                    time_idx = i
-                    break
-                    
-            valid_blocks = []
-            if time_idx != -1:
-                # The seconds struct comes directly before the subseconds struct in the ring buffer.
-                sec_idx = (time_idx - 1) % 12
-                for i, b in enumerate(blocks):
-                    if i != time_idx and i != sec_idx:
-                        valid_blocks.append(b)
-            else:
-                valid_blocks = blocks[:10]  # Fallback 
-                
-            for i, b in enumerate(valid_blocks[:10]):
-                lc_zc_array[i] = (b[0] << 8) | b[1]
-                lc_up_array[i] = b[2]
-                lc_su_array[i] = b[3]
-
-        base_data.update({
-            "type": "LC",
-            "obs_utc": obs_utc,
-            "l1a": [{"TIME": obs_met, "PKT_CNT": pkt_count, "BTO_ID": bto_id, "COUNT": raw_bins,
-                     **time_fields,
-                     "LC_ZC_CNT": lc_zc_array, "LC_UP_CNT": lc_up_array, "LC_SU_CNT": lc_su_array}],
-            "l1b": [{"TIME": obs_met, "PKT_CNT": pkt_count, "BTO_ID": bto_id, "COUNT": raw_bins,
-                     **time_fields,
-                     "LC_ZC_CNT": lc_zc_array, "LC_UP_CNT": lc_up_array, "LC_SU_CNT": lc_su_array}],
-        })
-        return base_data
-
-    # ---------------------------------------------------------------------
-    # Event-by-event
-    # ---------------------------------------------------------------------
-    elif apid == 0x0D7:
-        l1a, l1b = [], []
-        ptr = EVT_DATA_START
-
-        while ptr <= len(ccsds) - EVT_WORD_LEN:
-            wb = ccsds[ptr:ptr + EVT_WORD_LEN]
-
-            if wb == b"\x00\x00\x00\x00\x00\x00\x00\x00":
-                ptr += EVT_WORD_LEN
-                continue
-
-            adc_data = int.from_bytes(wb[0:2], "big")
-            ts_long = int.from_bytes(wb[2:4], "big")
-            ts_short = int.from_bytes(wb[4:6], "big")
-            raw_deadtime = int.from_bytes(wb[6:8], "big")
-
-            # -----------------------------------------------
-            # 0. Skip Multi-Word Event Blocks (Cross-Packet Safe)
-            # -----------------------------------------------
-            if d7_state.get("skip_next", 0) > 0:
-                d7_state["skip_next"] -= 1
-                ptr += EVT_WORD_LEN
-                continue
-
-            # -----------------------------------------------
-            # 1. Empty NAND Padding / Heartbeat Evaluator
-            # -----------------------------------------------
-            if adc_data == 0xFFFF and ts_long == 0xFFFF:
-                if ts_short == 0xFFFF:
-                    # Pure empty NAND flash padding. Discard.
-                    pass
-                else:
-                    d7_state["skip_next"] = 2
-                ptr += EVT_WORD_LEN
-                continue
-
-            # -----------------------------------------------
-            # 2. Start Frame Marker
-            # -----------------------------------------------
-            if adc_data == 0x0123 and ts_long == 0x4567:
-                d7_state["current_tid"] += 1
-                
-                pps_time = (raw_deadtime << 16) | ts_short
-                if pps_time >= 0:
-                    if pps_time < 1_000_000_000:
-                        anchor_utc = MET_EPOCH + datetime.timedelta(seconds=pps_time)
-                    else:
-                        anchor_utc = gps_seconds_to_utc(pps_time)
-                        
-                    if MIN_VALID_UTC <= anchor_utc <= MAX_VALID_UTC:
-                        d7_state["anchor_met"] = get_met(anchor_utc)
-                        d7_state["last_evt_met"] = d7_state["anchor_met"]
-                
-                d7_state["last_photon_dwt"] = None
-                ptr += EVT_WORD_LEN
-                continue
-
-            # -----------------------------------------------
-            # 3. End Frame Marker
-            # -----------------------------------------------
-            if adc_data == 0xABCD:
-                if ts_long == 0xABCD:
-                    d7_state["skip_next"] = 2
-                elif ts_long in [0xEF00, 0xEFFF]:
-                    d7_state["skip_next"] = 1
-                ptr += EVT_WORD_LEN
-                continue
-
-            # -----------------------------------------------
-            # 4. Photon Event (Standard & Saturated)
-            # -----------------------------------------------
-            
-            flag_su = (adc_data >> 15) & 1
-            flag_up = (adc_data >> 14) & 1
-            flag_ld = (adc_data >> 13) & 1
-            flag_pseudo = (adc_data >> 12) & 1
-
-            if (adc_data & 0x7FFF) == 0x7FFF:
-                pha = 4095 
-            else:
-                pha_raw = adc_data & 0x0FFF
-                pha_signed = pha_raw - 4096 if pha_raw >= 2048 else pha_raw
-                pha = abs(pha_signed)
-            
-            full_timestamp = (ts_long << 16) | ts_short
-            photon_dwt_24bit = (full_timestamp >> 8) & 0xFFFFFF
-
-            if d7_state.get("last_photon_dwt") is None:
-                d7_state["last_photon_dwt"] = photon_dwt_24bit
-                if d7_state.get("last_evt_met") is None:
-                    d7_state["last_evt_met"] = packet_met
-
-            tick_diff = photon_dwt_24bit - d7_state["last_photon_dwt"]
-            
-            if tick_diff < -0x800000: 
-                tick_diff += 0x1000000 
-            elif tick_diff > 0x800000: 
-                tick_diff -= 0x1000000
-
-            evt_met = d7_state["last_evt_met"] + (tick_diff * DWT_24BIT_TICK_SEC)
-            
-            d7_state["last_photon_dwt"] = photon_dwt_24bit
-            d7_state["last_evt_met"] = evt_met
-
-            active_tid = max(1, d7_state.get("current_tid", 1))
-            
-            # Calibration calculation for L1b
-            energy_kev = max(0.0, float(pha * E_SLOPE + E_INTERCEPT))
-            
-            l1a.append({
-                "TIME": evt_met,
-                "PKT_CNT": pkt_count,
-                "BTO_ID": bto_id,
-                "PHA": pha,
-                "FLAG_SU": flag_su,
-                "FLAG_UP": flag_up,
-                "FLAG_LD": flag_ld,
-                "FLAG_PSEUDO": flag_pseudo,
-                "DEADTIME": raw_deadtime,
-                "_TID": active_tid,
-            })
-            l1b.append({
-                "TIME": evt_met,
-                "PKT_CNT": pkt_count,
-                "BTO_ID": bto_id,
-                "PI": pha,
-                "ENERGY": energy_kev,
-                "DEADTIME": raw_deadtime,
-                "_TID": active_tid,
-            })
-
-            ptr += EVT_WORD_LEN
-
-        base_data.update({"type": "EVT", "l1a": l1a, "l1b": l1b})
-        return base_data
-
-    return None
-
-# =============================================================================
-# 4. HEADER & FITS UTILITIES
-# =============================================================================
-def get_ebounds_hdu():
-    channels = np.arange(MAX_CHANNELS, dtype=np.int16)
-    e_min = np.maximum(0, E_SLOPE * (channels - 0.5) + E_INTERCEPT)
-    e_max = np.maximum(0, E_SLOPE * (channels + 0.5) + E_INTERCEPT)
-
-    cols = [
-        fits.Column(name="CHANNEL", format="1I", array=channels),
-        fits.Column(name="E_MIN", format="1E", array=e_min, unit="keV"),
-        fits.Column(name="E_MAX", format="1E", array=e_max, unit="keV"),
-    ]
-    hdu = fits.BinTableHDU.from_columns(cols, name="EBOUNDS")
-    hdu.header.update({
-        "EXTNAME": "EBOUNDS",
-        "TELESCOP": "COSI",
-        "INSTRUME": "BTO",
-        "HDUCLASS": "OGIP",
-        "HDUCLAS1": "RESPONSE",
-        "HDUCLAS2": "EBOUNDS",
-        "CHANTYPE": "PI",
-        "DETCHANS": MAX_CHANNELS,
-    })
-    return hdu
-
-def get_eneband_hdu():
-    bin_width = MAX_CHANNELS // LC_NUM_BINS
-    minchan = np.arange(LC_NUM_BINS, dtype=np.int16) * bin_width
-    maxchan = minchan + bin_width - 1
-    maxchan[-1] = MAX_CHANNELS - 1
-
-    e_min = np.maximum(0, E_SLOPE * (minchan - 0.5) + E_INTERCEPT)
-    e_max = np.maximum(0, E_SLOPE * (maxchan + 0.5) + E_INTERCEPT)
-
-    cols = [
-        fits.Column(name="MINCHAN", format="1I", array=minchan),
-        fits.Column(name="MAXCHAN", format="1I", array=maxchan),
-        fits.Column(name="E_MIN", format="1E", array=e_min.astype(np.float32), unit="keV"),
-        fits.Column(name="E_MAX", format="1E", array=e_max.astype(np.float32), unit="keV"),
-    ]
-    hdu = fits.BinTableHDU.from_columns(cols, name="ENEBAND")
-    hdu.header.update({
-        "EXTNAME": "ENEBAND",
-        "TELESCOP": "COSI",
-        "INSTRUME": "BTO",
-        "HDUCLASS": "OGIP",
-        "HDUCLAS1": "RESPONSE",
-        "HDUCLAS2": "EBOUNDS",
-    })
-    return hdu
-
-def get_gti_hdu(t_start, t_stop):
-    cols = [
-        fits.Column(name="START", format="1D", unit="s", array=[t_start]),
-        fits.Column(name="STOP", format="1D", unit="s", array=[t_stop]),
-    ]
-    hdu = fits.BinTableHDU.from_columns(cols, name="GTI")
-    hdu.header.update({
-        "EXTNAME": "GTI",
-        "HDUCLASS": "OGIP",
-        "HDUCLAS1": "GTI",
-        "HDUCLAS2": "STANDARD"
-    })
-    return hdu
-
-def make_obs_id(utc_start: datetime.datetime, is_event: bool) -> str:
-    if is_event:
-        return f"{utc_start.strftime('%y%m%d')}000t"
-    return utc_start.strftime("%Y%m%d")
-
-def inject_metadata(hdu, t_start, t_stop, utc_start, utc_stop, is_primary=False, obs_id=None):
-    if obs_id is None:
-        obs_id = utc_start.strftime("%y%m%d") + "000t"
-
-    date_now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    caldb_ver = f"cs{utc_start.strftime('%Y%m%d')}"
-
-    header_data = {
-        "TELESCOP": ("COSI", "Telescope"),
-        "INSTRUME": ("BTO", "Instrument"),
-        "OBS_ID": (obs_id, "Observation ID"),
-        "DATE-OBS": (utc_start.strftime("%Y-%m-%dT%H:%M:%S"), "Start"),
-        "DATE-END": (utc_stop.strftime("%Y-%m-%dT%H:%M:%S"), "End"),
-        "ORIGIN": ("SSL", "Origin of fits file"),
-        "DATE": (date_now, "File creation date"),
-        "SEQNUM": (1, "Times dataset has been processed"),
-        "TLM2FITS": ("BTO_PIPELINE", "Telemetry converter"),
-        "CALDBVER": (caldb_ver, "CALDB version"),
-        "PROCVER": ("01.00.02", "Processing version"),
-        "OBSERVER": ("John Tomsick", "Principal Investigator")
-    }
-
-    if is_primary:
-        header_data.update({
-            "CREATOR": ("BTO_LIVE_V5.26", "Software"),
-        })
-    else:
-        header_data.update({
-            "HDUCLASS": ("OGIP", "Standard"),
-            "DATAMODE": ("NORMAL", "Datamode"),
-            "OBJECT": ("CAL_SOURCE", "Target"),
-            "TIMESYS": ("TT", "Time System"),
-            "MJDREFI": (60676, "MJD Ref"),
-            "MJDREFF": (0.0008007407407407, "MJD offset"),
-            "TIMEREF": ("LOCAL", "Ref Frame"),
-            "TASSIGN": ("SATELLITE", "Time clock"),
-            "TIMEUNIT": ("s", "Time unit"),
-            "TSTART": (t_start, "Start MET"),
-            "TSTOP": (t_stop, "Stop MET"),
-            "CLOCKAPP": ("F", "Clock corr?"),
-        })
-
-    for key, (val, comment) in header_data.items():
-        hdu.header[key] = (val, comment)
-
-def _make_column(name, values):
-    arr = np.array(values)
-    unit = None
-
-    if name in ["TIME", "DEADTIME"]:
-        fmt = "1D"
-        unit = "s"
-    elif name in ["t_ext", "t_det1", "t_det2"]:
-        fmt = "1E"
-        unit = "degC"
-    elif name in ["t_ext_raw", "t_det1_raw", "t_det2_raw"]:
-        fmt = "1J"
-        unit = "ADC"
-    elif name == "COUNT":
-        fmt = f"{LC_NUM_BINS}J"
-        unit = "ct"
-    elif name in ["HIST_SEC", "HIST_TICKS"]:
-        fmt = "1K"  # unsigned uint32 telemetry plus -1 for unknown legacy data
-    elif name in ["LC_ZC_CNT", "LC_UP_CNT", "LC_SU_CNT"]:
-        fmt = "10J"
-        unit = "ct"
-    elif name in ["PKT_CNT", "BTO_ID", "BTO_MODE", "FSW_VER", "WD_RESET", "RESET_REASON", "FAULT_STATUS", "DET_PWR_STATUS", "ANALOG_STATUS", "FLAG_SU", "FLAG_UP", "FLAG_LD", "FLAG_PSEUDO"]:
-        fmt = "1I"
-    elif name in ["SUT", "CMD_CNT", "FAIL_CMD_CNT", "CS_ERR_CNT", "HIST_WPTR", "HIST_RPTR",
-                  "FLASH_ERASE_FAIL", "ZC_CNT", "SU_CNT",
-                  "vmon_p12_1_raw", "vmon_m12_1_raw", "vmon_p12_2_raw", "vmon_m12_2_raw",
-                  "imon_5v_1_raw", "imon_5v_2_raw", "spare_raw", "it_cs_raw",
-                  "HIST_NAND_WPTR", "HIST_NAND_RPTR", "PHOT_NAND_WPTR", "PHOT_NAND_RPTR",
-                  "LAST_GRB_TIME", "LAST_GRB_NAND", "LAST_GRB_ID"]:
-        fmt = "1J"
-    elif name in ["PI", "PHA"]:
-        fmt = "1I"
-        unit = "chan"
-    elif name == "ENERGY":
-        fmt = "1E"
-        unit = "keV"
-    else:
-        fmt = "1J"
-
-    return fits.Column(name=name, format=fmt, array=arr, unit=unit)
-
-
-def _flush_lightcurve(path, incoming, tier):
-    """Write one histogram extension per detector, including on later flushes.
-
-    A legacy merged table can be split only if its rows retain BTO_ID. DETNAM
-    alone is insufficient evidence: issue #9 reports mislabeled mixed tables.
+from astropy.time import Time
+
+
+# 1. Constants. Keep firmware-dependent assumptions together for review.
+VERSION = "4.0.1"
+ARCHIVE_FORMAT = "BTO_BINARY_FITS_V4"
+PREVIOUS_ARCHIVE_FORMAT = "BTO_BINARY_FITS_V3"
+GPS_AT_MET_ZERO = 1_419_724_818       # 2025-01-01 00:00:00 UTC
+MJDREFI = 60676
+MJDREFF = 69.184 / 86400.0          # The same reference instant, expressed in TT
+PPS_HZ = 40_000_000
+DWT_HZ = 300_000_000
+DWT_CYCLE = 2**32                  # Only the upper 24 DWT bits are in events
+DWT_QUANTUM = 256                  # One event-clock step, in 300 MHz cycles
+DEADTIME_TICK = 0.5e-6             # seconds per telemetry deadtime tick
+MAX_ANCHOR_SPAN = 6.0             # Less than half the 14.3166 s DWT cycle
+CLOCK_TOLERANCE = 100e-6           # Allowed fractional clock-rate difference
+SYNC = b"\xeb\x90"
+SCIENCE_APIDS = (0xD6, 0xD7, 0xD8)
+DATA_LENGTHS = {0xD6: (128,), 0xD7: (246,), 0xD8: (82, 84)}
+
+# TIME_QUAL bits. Zero means that the stated timing checks passed.
+BAD_CLOCK = 1
+SEQUENCE_GAP = 2
+NO_ANCHOR = 4
+BAD_MARKER = 8
+BAD_DWT = 16
+UNCERTAIN_RECORD = 32
+BAD_DEADTIME = 64
+
+# Python < 3.10 compatibility: dataclass(slots=True) was added in Python 3.10.
+DATACLASS_SLOTS = {"slots": True} if sys.version_info >= (3, 10) else {}
+
+
+class ParseError(ValueError):
+    """Input cannot be decoded without guessing or losing bytes."""
+
+
+@dataclass(**DATACLASS_SLOTS)
+class Packet:
+    source: int
+    offset: int                    # First byte in the original binary file
+    header_offset: int             # Absolute location of the CCSDS header
+    apid: int
+    sequence: int
+    data: bytes                    # Starts AFTER the six-byte primary header
+    gap: bool = False
+
+    @property
+    def detector(self):
+        return self.data[8]
+
+    @property
+    def time(self):
+        seconds, ticks = struct.unpack_from(">II", self.data)
+        if GPS_AT_MET_ZERO <= seconds < 0xFFFFFFFF and 0 <= ticks < PPS_HZ:
+            return (seconds - GPS_AT_MET_ZERO) + ticks / PPS_HZ
+        return float("nan")
+
+
+# 2. Binary framing. Never search inside payloads for a new sync word.
+def xor_checksum(body):
+    """BTO XOR16, seeded with FFFF; excludes EB90 and the checksum itself."""
+    if len(body) % 2:
+        raise ParseError("XOR16 requires an even number of packet bytes")
+    value = 0xFFFF
+    for (word,) in struct.iter_unpack(">H", body):
+        value ^= word
+    return value
+
+
+def read_packets(path, source=0, framing="auto", checksum="absent"):
+    """Yield length-delimited CCSDS packets from a .bin file.
+
+    Total CCSDS bytes = 6 + (packet_length + 1). The uploaded binaries have
+    neither EB90 nor an external checksum. Both are supported explicitly for
+    other captures. A truncated packet is an error, including at end of file.
     """
-    names = [name for name in incoming[0] if not name.startswith("_")]
-    if "BTO_ID" not in names:
-        raise ValueError("Lightcurve rows require BTO_ID; cannot infer a detector")
-    rows = []
-    primary = fits.PrimaryHDU()
-    auxiliary = []
-    if os.path.exists(path):
-        with fits.open(path, memmap=False) as old:
-            primary = old[0].copy()
-            for hdu in old[1:]:
-                if hdu.name in ("BTO_SPECHIST", *LC_HDU_NAMES.values()):
-                    if "BTO_ID" not in hdu.columns.names:
-                        raise ValueError(
-                            f"{path}: existing lightcurve has no per-row BTO_ID. "
-                            "Regenerate it from the raw log in a fresh archive; "
-                            "its DETNAM header cannot identify mixed detector rows."
-                        )
-                    legacy_defaults = {"TIME_QUAL": 2, "HIST_SEC": -1, "HIST_TICKS": -1}
-                    old_names = set(hdu.columns.names)
-                    if (old_names - set(names)
-                            or set(names) - old_names - set(legacy_defaults)):
-                        raise ValueError(f"{path}: incompatible lightcurve columns; regenerate from raw logs")
-                    rows.extend({name: row[name] if name in old_names else legacy_defaults[name]
-                                 for name in names} for row in hdu.data)
-                elif hdu.name != "GTI":
-                    auxiliary.append(hdu.copy())
-    rows.extend(incoming)
-    groups = {bid: [] for bid in LC_HDU_NAMES}
-    for row in rows:
-        bid = row["BTO_ID"]
-        if bid not in groups:
-            raise ValueError(f"Invalid lightcurve BTO_ID: {bid!r}; expected 0 or 1")
-        groups[bid].append(row)
-    for group in groups.values():
-        group.sort(key=lambda row: float(row["TIME"]))
-
-    t_start = min(float(row["TIME"]) for row in rows)
-    t_stop = max(float(row["TIME"]) for row in rows)
-    utc_start = MET_EPOCH + datetime.timedelta(seconds=t_start)
-    utc_stop = MET_EPOCH + datetime.timedelta(seconds=t_stop)
-    obs_id = make_obs_id(utc_start, is_event=False)
-    inject_metadata(primary, t_start, t_stop, utc_start, utc_stop, is_primary=True, obs_id=obs_id)
-    primary.header["TSTART"] = t_start
-    primary.header["TSTOP"] = t_stop
-    hdus = [primary]
-    for bid, group in groups.items():
-        columns = [_make_column(name, [row[name] for row in group]) for name in names]
-        hdu = fits.BinTableHDU.from_columns(columns, name=LC_HDU_NAMES[bid])
-        start = float(group[0]["TIME"]) if group else t_start
-        stop = float(group[-1]["TIME"]) if group else t_stop
-        inject_metadata(hdu, start, stop,
-                        MET_EPOCH + datetime.timedelta(seconds=start),
-                        MET_EPOCH + datetime.timedelta(seconds=stop), obs_id=obs_id)
-        hdu.header.update({
-            "INSTRUME": f"BTO{bid}", "DETNAM": f"BTO{bid}", "BTO_ID": bid,
-            "EXTVER": bid + 1, "TIMEDEL": LC_TIMEDEL,
-            "HDUCLAS1": "TEMPORALDATA", "HDUCLAS2": "EVRATE",
-            "TQDEF": "0=observation; 1=packet fallback; 2=legacy unknown",
-            "NUNCORR": sum(row.get("TIME_QUAL", 2) != 0 for row in group),
-        })
-        if not group:
-            # Keep the workbook's two-detector layout without inventing rows
-            # or assigning the other detector's observation bounds.
-            for keyword in ("TSTART", "TSTOP", "DATE-OBS", "DATE-END"):
-                del hdu.header[keyword]
-        hdus.append(hdu)
-
-    gti = get_gti_hdu(t_start, t_stop)
-    inject_metadata(gti, t_start, t_stop, utc_start, utc_stop, obs_id=obs_id)
-    hdus.append(gti)
-    if tier == "L1b" and not any(hdu.name == "ENEBAND" for hdu in auxiliary):
-        auxiliary.append(get_eneband_hdu())
-    hdus.extend(auxiliary)
-
-    # Leave the old file and caller's cache intact if a write fails. Updating
-    # all HDUs together also refreshes their FITS CHECKSUM/DATASUM values.
-    directory = os.path.dirname(os.path.abspath(path))
-    os.makedirs(directory, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".bto-lc-", suffix=".fits", dir=directory)
-    os.close(fd)
-    try:
-        with fits.HDUList(hdus) as output:
-            output.writeto(temporary, overwrite=True, checksum=True, output_verify="exception")
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-
-
-def flush_cache_to_disk(cache, tier):
-    for path, data in list(cache.items()):
-        if not data["rows"]:
-            continue
-
-        if "COUNT" in data["rows"][0]:
-            _flush_lightcurve(path, data["rows"], tier)
-            print(f"[DISK IO] {tier} Flushed {len(data['rows'])} rows to {os.path.basename(path)}")
-            del cache[path]
-            continue
-
-        try:
-            # Group incoming rows by BTO_ID to segregate det 0 and 1 streams
-            groups = {}
-            for r in data["rows"]:
-                bid = r.get("BTO_ID", 0)
-                if bid not in groups:
-                    groups[bid] = []
-                groups[bid].append(r)
-            
-            # Sort each group by TIME
-            for bid in groups:
-                groups[bid].sort(key=lambda r: float(r["TIME"]))
-            
-            # Determine extension types from the first row of the first group
-            first_row = data["rows"][0]
-            if "PI" in first_row or "PHA" in first_row:
-                ext_name, hdu_class = "BTO_EVENT", "EVENT"
-            elif "t_ext_raw" in first_row:
-                ext_name, hdu_class = "HK", "HK"
-            elif "COUNT" in first_row:
-                ext_name, hdu_class = "BTO_SPECHIST", "LIGHTCURVE"
-            else:
-                ext_name, hdu_class = "DATA", "DATA"
-
-            # Global start/stop times for observation and GTI scope
-            global_t_s = min(float(g[0]["TIME"]) for g in groups.values())
-            global_t_e = max(float(g[-1]["TIME"]) for g in groups.values())
-            global_utc_start = MET_EPOCH + datetime.timedelta(seconds=global_t_s)
-            global_utc_stop = MET_EPOCH + datetime.timedelta(seconds=global_t_e)
-            obs_id = make_obs_id(global_utc_start, is_event=(ext_name == "BTO_EVENT"))
-            
-            if os.path.exists(path):
-                with fits.open(path, mode='update', memmap=False) as hdul:
-                    for bid, rows in groups.items():
-                        detnam = f"BTO{bid}"
-                        
-                        # Find if an HDU with this DETNAM already exists
-                        target_hdu_idx = None
-                        for i, hdu in enumerate(hdul):
-                            if hdu.name == ext_name and hdu.header.get("DETNAM") == detnam:
-                                target_hdu_idx = i
-                                break
-                        
-                        if target_hdu_idx is not None:
-                            # Append to existing HDU
-                            old_data = hdul[target_hdu_idx].data
-                            new_tstop = max(hdul[target_hdu_idx].header.get("TSTOP", global_t_e), float(rows[-1]["TIME"]))
-                            
-                            new_table = fits.BinTableHDU.from_columns(
-                                hdul[target_hdu_idx].columns,
-                                nrows=len(old_data) + len(rows),
-                                name=hdul[target_hdu_idx].name,
-                                header=hdul[target_hdu_idx].header,
-                            )
-                            for col in hdul[target_hdu_idx].columns.names:
-                                incoming = np.array([r[col] for r in rows])
-                                new_table.data[col] = np.concatenate([old_data[col], incoming])
-                            
-                            new_table.header["TSTOP"] = new_tstop
-                            hdul[target_hdu_idx] = new_table
-                        else:
-                            # Create a brand new HDU for this BTO_ID and append to file
-                            cols = []
-                            for k in rows[0].keys():
-                                if k.startswith("_"): continue
-                                values = [r[k] for r in rows]
-                                cols.append(_make_column(k, values))
-                                
-                            new_hdu = fits.BinTableHDU.from_columns(cols, name=ext_name)
-                            t_s = float(rows[0]["TIME"])
-                            t_e = float(rows[-1]["TIME"])
-                            inject_metadata(new_hdu, t_s, t_e, MET_EPOCH + datetime.timedelta(seconds=t_s), MET_EPOCH + datetime.timedelta(seconds=t_e), obs_id=obs_id)
-                            
-                            # Add standard class info + correct EXTVER/DETNAM mapping
-                            new_hdu.header.update({
-                                "HDUCLAS1": hdu_class, 
-                                "HDUCLAS2": "ALL", 
-                                "DETNAM": detnam,
-                                "EXTVER": bid + 1
-                            })
-                            
-                            if ext_name == "BTO_EVENT" and tier == "L1b":
-                                new_hdu.header.update({"CHANTYPE": "PI", "DETCHANS": MAX_CHANNELS})
-                            if ext_name == "BTO_SPECHIST":
-                                new_hdu.header.update({"BINTYPE": "LINEAR", "TIMEDEL": 1.0}) # Updated from 5.0 to 1.0 cadence
-                                
-                            hdul.append(new_hdu)
-                    
-                    # Update global GTI stop threshold
-                    gti_idx = None
-                    for i, hdu in enumerate(hdul):
-                        if hdu.name == "GTI":
-                            gti_idx = i
-                            break
-                    if gti_idx is not None:
-                        gti_hdu = hdul[gti_idx]
-                        if len(gti_hdu.data) > 0:
-                            gti_hdu.data["STOP"][-1] = max(gti_hdu.data["STOP"][-1], global_t_e)
-                    
-                    hdul[0].header["DATE-END"] = global_utc_stop.strftime("%Y-%m-%dT%H:%M:%S")
-                    hdul.flush()
-            else:
-                # Create entirely new FITS file
-                hdul_list = [fits.PrimaryHDU()]
-                inject_metadata(hdul_list[0], global_t_s, global_t_e, global_utc_start, global_utc_stop, is_primary=True, obs_id=obs_id)
-                
-                for bid, rows in groups.items():
-                    detnam = f"BTO{bid}"
-                    cols = []
-                    for k in rows[0].keys():
-                        if k.startswith("_"): continue
-                        values = [r[k] for r in rows]
-                        cols.append(_make_column(k, values))
-                        
-                    new_hdu = fits.BinTableHDU.from_columns(cols, name=ext_name)
-                    t_s = float(rows[0]["TIME"])
-                    t_e = float(rows[-1]["TIME"])
-                    inject_metadata(new_hdu, t_s, t_e, MET_EPOCH + datetime.timedelta(seconds=t_s), MET_EPOCH + datetime.timedelta(seconds=t_e), obs_id=obs_id)
-                    
-                    new_hdu.header.update({
-                        "HDUCLAS1": hdu_class, 
-                        "HDUCLAS2": "ALL", 
-                        "DETNAM": detnam,
-                        "EXTVER": bid + 1
-                    })
-                    
-                    if ext_name == "BTO_EVENT" and tier == "L1b":
-                        new_hdu.header.update({"CHANTYPE": "PI", "DETCHANS": MAX_CHANNELS})
-                    if ext_name == "BTO_SPECHIST":
-                        new_hdu.header.update({"BINTYPE": "LINEAR", "TIMEDEL": 1.0}) # Updated from 5.0 to 1.0 cadence
-                        
-                    hdul_list.append(new_hdu)
-                    
-                if ext_name in ["BTO_EVENT", "BTO_SPECHIST", "HK"]:
-                    hdul_list.append(get_gti_hdu(global_t_s, global_t_e))
-                
-                if tier == "L1b":
-                    if ext_name == "BTO_EVENT":
-                        hdul_list.append(get_ebounds_hdu())
-                    elif ext_name == "BTO_SPECHIST":
-                        hdul_list.append(get_eneband_hdu())
-
-                fits.HDUList(hdul_list).writeto(path, overwrite=True, checksum=True)
-
-            print(f"[DISK IO] {tier} Flushed {len(data['rows'])} rows to {os.path.basename(path)}")
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"[ERROR] {e}")
-
-        del cache[path]
-
-# =============================================================================
-# 5. EXECUTION
-# =============================================================================
-def read_input_stream(target_path, is_live):
-    if is_live:
+    if framing not in ("auto", "ccsds", "sync") or checksum not in ("absent", "required"):
+        raise ValueError("Invalid framing or checksum option")
+    with Path(path).open("rb") as stream:
+        first = stream.read(2)
+        stream.seek(0)
+        has_sync = first == SYNC if framing == "auto" else framing == "sync"
         while True:
-            files = sorted(glob.glob(os.path.join(target_path, "*.txt")), key=os.path.getmtime)
-            if not files:
-                time.sleep(1)
-                continue
+            offset = stream.tell()
+            prefix = stream.read(2 if has_sync else 6)
+            if not prefix:
+                return
+            if has_sync and prefix != SYNC:
+                raise ParseError(f"{path}, byte {offset}: expected EB90")
+            header = stream.read(6) if has_sync else prefix
+            if len(header) != 6:
+                raise ParseError(f"{path}, byte {offset}: truncated primary header")
+            packet_id, sequence, length = struct.unpack(">HHH", header)
+            apid = packet_id & 0x7FF
+            if packet_id >> 13:
+                raise ParseError(f"{path}, byte {offset}: unsupported CCSDS version")
+            if apid in SCIENCE_APIDS:
+                if packet_id & 0x1800 != 0x0800 or sequence >> 14 != 3:
+                    raise ParseError(f"{path}, byte {offset}: invalid BTO telemetry header")
+                if length + 1 not in DATA_LENGTHS[apid]:
+                    raise ParseError(f"{path}, byte {offset}: APID {apid:#x} data length {length + 1}")
+            data = stream.read(length + 1)
+            if len(data) != length + 1:
+                raise ParseError(f"{path}, byte {offset}: truncated APID {apid:#x} payload")
+            if checksum == "required":
+                check = stream.read(2)
+                if len(check) != 2 or int.from_bytes(check, "big") != xor_checksum(header + data):
+                    raise ParseError(f"{path}, byte {offset}: missing or incorrect XOR16 checksum")
+            if apid in SCIENCE_APIDS and data[8] not in (0, 1):
+                raise ParseError(f"{path}, byte {offset}: invalid detector ID {data[8]}")
+            yield Packet(source, offset, offset + (2 if has_sync else 0),
+                         apid, sequence & 0x3FFF, data)
 
-            latest = files[-1]
-            try:
-                with open(latest, "r") as f:
-                    f.seek(0, os.SEEK_END)
-                    while True:
-                        line = f.readline()
-                        if not line:
-                            break
-                        clean = clean_hex_fragment(line)
-                        if len(clean) % 2 != 0:
-                            clean = clean[:-1]
-                        if clean:
-                            yield clean
-            except FileNotFoundError:
-                time.sleep(1)
 
-            time.sleep(0.25)
+# 3. Common time and array helpers.
+def mission_time(seconds, ticks=0):
+    """GPS/PPS -> elapsed SI seconds from the ICD's mission reference instant."""
+    sec, sub = np.broadcast_arrays(np.asarray(seconds, dtype=np.int64),
+                                   np.asarray(ticks, dtype=np.int64))
+    valid = (sec >= GPS_AT_MET_ZERO) & (sec < 0xFFFFFFFF) & (sub >= 0) & (sub < PPS_HZ)
+    return np.where(valid, (sec - GPS_AT_MET_ZERO) + sub / PPS_HZ, np.nan)
+
+
+def utc_string(met):
+    return Time(GPS_AT_MET_ZERO + float(met), format="gps").utc.isot
+
+
+def date_key(met):
+    return utc_string(met)[:10].replace("-", "") if np.isfinite(met) else "undated"
+
+
+def payload_array(packets, width=None):
+    """A byte matrix is convenient for fixed-layout telemetry packets."""
+    if width is None:
+        raw = b"".join(p.data for p in packets)
     else:
-        files = (
-            [target_path]
-            if os.path.isfile(target_path)
-            else sorted(glob.glob(os.path.join(target_path, "*.txt")))
-        )
+        raw = b"".join(p.data[:width] for p in packets)
+    return np.frombuffer(raw, dtype=np.uint8).reshape(len(packets), -1)
 
-        for file in files:
-            hex_lines = []
-            with open(file, "r") as f:
-                for line in f:
-                    clean = clean_hex_fragment(line.strip())
-                    if clean:
-                        hex_lines.append(clean)
 
-            full_hex = "".join(hex_lines)
+def unsigned_field(data, offset, width, count=1):
+    """Read big-endian unsigned fields without any signed integer conversion."""
+    field = np.ascontiguousarray(data[:, offset:offset + width * count])
+    values = field.view(f">u{width}").reshape(len(data), count).astype(np.int64)
+    return values[:, 0] if count == 1 else values
 
-            if len(full_hex) % 2 != 0:
-                print(f"[WARNING] File {file} ended with incomplete byte. Truncating last char.")
-                full_hex = full_hex[:-1]
 
-            if full_hex:
-                yield full_hex
-
-def run_pipeline(input_path: str, levels: list, is_live: bool):
-    router = ArchiveRouter()
-    cache_a, cache_b = {}, {}
-    
-    global_d7_state = {
-        "current_tid": 0, 
-        "last_sut_val": 0,
-        "last_photon_dwt": None,
-        "last_evt_met": None,
-        "hk_sut": None,
-        "skip_next": 0   
+def provenance(packets):
+    header_bytes = payload_array(packets, width=8)
+    pkt_sec = unsigned_field(header_bytes, 0, 4)
+    pkt_sub = unsigned_field(header_bytes, 4, 4)
+    return {
+        "PKT_CNT": np.array([p.sequence for p in packets], dtype=np.int16),
+        "SOURCE_ID": np.array([p.source for p in packets], dtype=np.int32),
+        "BYTE_OFFSET": np.array([p.header_offset for p in packets], dtype=np.int64),
+        "PKT_TIME": mission_time(pkt_sec, pkt_sub),
     }
-     
-    packet_count = 0
-    total_parsed = 0
-    
-    for hex_chunk in read_input_stream(input_path, is_live):
-        if not hex_chunk:
-            continue
 
-        try:
-            stream = bytes.fromhex(hex_chunk)
-        except ValueError as e:
-            print(f"[WARNING] Skipping invalid hex chunk: {e}")
-            continue
 
-        idx = 0
-        while idx <= len(stream) - 16:
-            if stream[idx:idx + 2] != b"\xeb\x90":
-                idx += 1
-                continue
+def time_order(values):
+    """Stable chronological order; unknown times remain at the end."""
+    return np.argsort(np.where(np.isfinite(values), values, np.inf), kind="stable")
 
-            apid = int.from_bytes(stream[idx + 2:idx + 4], "big") & 0x07FF
 
-            if apid not in [0x0D6, 0x0D7, 0x0D8]:
-                idx += 1
-                continue
+def subset(table, indices):
+    return {key: value[indices] for key, value in table.items()}
 
-            pkt_data_len = int.from_bytes(stream[idx + 6:idx + 8], "big")
-            blen = pkt_data_len + 9
 
-            if blen > 65536 or idx + blen > len(stream):
-                idx += 1
-                continue
+# 4. D6 histograms and 100 ms counters.
+def decode_histograms(packets):
+    d = payload_array(packets)
+    seconds, ticks = unsigned_field(d, 71, 4), unsigned_field(d, 75, 4)
+    dead_ticks = unsigned_field(d, 67, 4)
+    deadtime = dead_ticks * DEADTIME_TICK
+    time = mission_time(seconds, ticks)
+    quality = np.where(np.isfinite(time), 0, BAD_CLOCK)
+    quality |= np.array([SEQUENCE_GAP if p.gap else 0 for p in packets])
+    quality |= np.where(deadtime <= 1.0, 0, BAD_DEADTIME)
+    hist = dict(TIME=time, **provenance(packets),
+                TIMEDEL=np.where(deadtime <= 1.0, 1.0 - deadtime, np.nan),
+                COUNT=unsigned_field(d, 9, 2, 29), TIME_QUAL=quality,
+                DEADTIME=deadtime, DEAD_TICKS=dead_ticks,
+                HIST_SEC=seconds, HIST_TICKS=ticks, BINMODE=d[:, 127].astype(int))
 
-            packet = stream[idx:idx + blen]
-            p = decode_packet(packet, apid, global_d7_state)
+    # Unlike the explicitly swapped histogram fields, these eight bytes were
+    # copied from an MCU structure: little-endian PPS, then 24-bit ticks + FF.
+    lc_seconds = np.ascontiguousarray(d[:, 119:123]).view("<u4").ravel().astype(np.int64)
+    lc_ticks = (d[:, 123].astype(np.int64) + (d[:, 124].astype(np.int64) << 8)
+                + (d[:, 125].astype(np.int64) << 16)) << 8
+    lc_end = mission_time(lc_seconds, lc_ticks)
+    lc_end[d[:, 126] != 255] = np.nan
+    blocks = d[:, 79:119].reshape(-1, 10, 4).astype(np.int64)
+    counters = np.stack((blocks[:, :, 0] * 256 + blocks[:, :, 1],
+                         blocks[:, :, 2], blocks[:, :, 3]), axis=2).reshape(-1, 3)
 
-            if p:
-                total_parsed += 1
-                if "l0" in levels:
-                    with open(router.get_path("L0", apid, p["utc"]), "ab") as f0:
-                        f0.write(packet)
+    # The samples contain cumulative counters. The first bin needs a previous
+    # packet; later bins use the preceding sample in their own packet.
+    counts = (counters - np.roll(counters, 1, axis=0)) % [65536, 256, 256]
+    count_quality = np.zeros(len(counts), dtype=np.int16)
+    bad_first = np.ones(len(packets), dtype=bool)
+    if len(packets) > 1:
+        bad_first[1:] = (~np.isfinite(lc_end[1:] - lc_end[:-1])
+                         | (np.abs(lc_end[1:] - lc_end[:-1] - 1.0) > 0.01)
+                         | np.array([p.gap for p in packets[1:]]))
+    unknown = np.flatnonzero(bad_first) * 10
+    counts[unknown] = -1
+    count_quality[unknown] = 1
+    lc_time = (lc_end[:, None] - np.arange(9, -1, -1)[None, :] * 0.1).ravel()
+    lc = {key: np.repeat(value, 10) for key, value in provenance(packets).items()}
+    lc.update(TIME=lc_time, TIMEDEL=np.full(len(counts), 0.1), COUNT=counts,
+              COUNTER_RAW=counters, COUNT_QUAL=count_quality,
+              TIME_QUAL=np.where(np.isfinite(lc_time), 0, BAD_CLOCK),
+              SAMPLE=np.tile(np.arange(10, dtype=np.int16), len(packets)))
+    return hist, lc
 
-                if "l1a" in levels and p.get("type") in ["EVT", "HK", "LC"]:
-                    if p["type"] == "EVT":
-                        for row in p["l1a"]:
-                            pa = router.get_path("L1a", apid, p["utc"], row.get("_TID", 0))
-                            if pa not in cache_a:
-                                cache_a[pa] = {"rows": [], "met_list": []}
-                            cache_a[pa]["rows"].append(row)
-                            cache_a[pa]["met_list"].append(p["met"])
-                    else:
-                        pa = router.get_path("L1a", apid, p.get("obs_utc", p["utc"]), p.get("tid", 0))
-                        if pa not in cache_a:
-                            cache_a[pa] = {"rows": [], "met_list": []}
-                        cache_a[pa]["rows"].extend(p["l1a"])
-                        cache_a[pa]["met_list"].append(p["met"])
 
-                if "l1b" in levels and p.get("type") in ["EVT", "HK", "LC"]:
-                    if p["type"] == "EVT":
-                        for row in p["l1b"]:
-                            pb = router.get_path("L1b", apid, p["utc"], row.get("_TID", 0))
-                            if pb not in cache_b:
-                                cache_b[pb] = {"rows": [], "met_list": []}
-                            cache_b[pb]["rows"].append(row)
-                            cache_b[pb]["met_list"].append(p["met"])
-                    else:
-                        pb = router.get_path("L1b", apid, p.get("obs_utc", p["utc"]), p.get("tid", 0))
-                        if pb not in cache_b:
-                            cache_b[pb] = {"rows": [], "met_list": []}
-                        cache_b[pb]["rows"].extend(p["l1b"])
-                        cache_b[pb]["met_list"].append(p["met"])
+# 5. D8 housekeeping. Offsets are relative to the CCSDS DATA field.
+HK_FIELDS = [
+    ("BTO_MODE", 9, "B"), ("UPTIME_TICKS", 10, "I"),
+    ("CMD_CNT", 14, "H"), ("FAIL_CMD_CNT", 16, "H"), ("CS_ERR_CNT", 18, "H"),
+    ("FSW_VER", 20, "B"), ("WD_RESET", 21, "B"), ("RESET_REASON", 22, "B"),
+    ("FAULT_STATUS", 23, "B"), ("DET_PWR_STATUS", 24, "B"), ("ANALOG_STATUS", 25, "B"),
+    ("HIST_WPTR", 26, "H"), ("HIST_RPTR", 28, "H"),
+    ("HIST_NAND_WPTR", 30, "I"), ("HIST_NAND_RPTR", 34, "I"),
+    ("PHOT_NAND_WPTR", 38, "I"), ("PHOT_NAND_RPTR", 42, "I"),
+    ("FLASH_ERASE_FAIL", 46, "H"), ("LAST_GRB_TIME_RAW", 48, "I"),
+    ("LAST_GRB_NAND", 52, "I"), ("LAST_GRB_ID", 56, "I"),
+    ("ZERO_CROSSING_COUNT", 60, "H"), ("SUPPER_UPPER_COUNT", 62, "H"),
+    ("TEMP_EXT_ADC", 64, "H"), ("TEMP_DET_0_ADC", 66, "H"), ("TEMP_DET_1_ADC", 68, "H"),
+    ("AB1_VMON_10V_P_ADC", 70, "H"), ("AB1_VMON_10V_N_ADC", 72, "H"),
+    ("AB2_VMON_10V_P_ADC", 74, "H"), ("AB2_VMON_10V_N_ADC", 76, "H"),
+    ("DB1_IMON_5V_ADC", 78, "H"), ("DB2_IMON_5V_ADC", 80, "H"),
+]
+HK_WIDTHS = {"B": 1, "H": 2, "I": 4}
+SENSORS = [(name[:-4], "mA" if name.startswith("DB") else
+            "C" if name.startswith("TEMP") else "V")
+           for name, _, _ in HK_FIELDS if name.endswith("_ADC")]
 
-                packet_count += 1
-                idx += blen
+
+def decode_housekeeping(packets, calibration):
+    d = payload_array(packets, width=82)
+    result = provenance(packets)
+    result["TIME"] = result["PKT_TIME"].copy()
+    result["BTO_ID"] = d[:, 8].copy()
+    for name, offset, code in HK_FIELDS:
+        result[name] = unsigned_field(d, offset, HK_WIDTHS[code])
+    result["SPARE_RAW"] = np.array([int.from_bytes(p.data[82:84], "big")
+                                     if len(p.data) == 84 else -1 for p in packets], dtype=np.int64)
+    result["LAST_GRB_TIME"] = mission_time(result["LAST_GRB_TIME_RAW"])
+    result["TIME_QUAL"] = np.where(np.isfinite(result["TIME"]), 0, BAD_CLOCK)
+    result["TIME_QUAL"] |= np.array([SEQUENCE_GAP if p.gap else 0 for p in packets])
+    for name, _ in SENSORS:
+        result[name] = np.full(len(packets), np.nan, dtype=np.float32)
+        for detector in (0, 1):
+            coefficients = detector_calibration(calibration, detector).get("housekeeping", {}).get(name)
+            if coefficients is not None:
+                chosen = result["BTO_ID"] == detector
+                slope, intercept = coefficients
+                result[name][chosen] = result[name + "_ADC"][chosen] * slope + intercept
+    return result
+
+
+# 6. D7 photon records. Each detector is decoded independently.
+def low_word_first(words, offset):
+    """Marker 32-bit values store the LOW 16-bit word before the HIGH word."""
+    return int(words[offset]) | (int(words[offset + 1]) << 16)
+
+
+def decode_events(packets):
+    """Decode the current three-record heartbeat format used by the samples.
+
+    START contains trigger flags and an ID, NOT a timestamp. Events receive
+    TIME only between two consistent heartbeat anchors. Counter wrap cannot
+    be resolved by simply adding the nearest modulo difference repeatedly.
+    """
+    for p in packets:
+        if p.data[13] != 255:
+            raise ParseError(f"D7 source {p.source}, byte {p.offset}: missing record filler FF")
+    words = np.frombuffer(b"".join(p.data[14:] for p in packets), dtype=">u2").reshape(-1, 4)
+    n = len(words)
+    packet_index = np.repeat(np.arange(len(packets)), 29)
+    record_index = np.tile(np.arange(29), len(packets))
+    event_mask = ~np.all(words == 0, axis=1)
+    marker_mask = np.zeros(n, dtype=bool)
+    erased = np.all(words == 65535, axis=1)
+    event_mask[erased] = False
+    starts = (words[:, 0] == 0x0123) & (words[:, 1] == 0x4567)
+    heartbeats = (words[:, 0] == 65535) & (words[:, 1] == 65535) & ~erased
+    ends = (words[:, 0] == 0xABCD) & (words[:, 1] == 0xABCD)
+    continuations = (words[:, 0] == 0xABCD) & np.isin(words[:, 1], [0xEF00, 0xEFFF])
+    gaps = np.zeros(n, dtype=bool)
+    gaps[np.arange(len(packets)) * 29] = [p.gap for p in packets]
+    segment_break = gaps | erased | starts
+    group_break = starts.copy()
+    group_break[0] = True
+    quality = np.full(n, NO_ANCHOR, dtype=np.int16)
+    marker_rows = []
+    anchors = []
+
+    for pos in np.flatnonzero(starts | heartbeats | ends | continuations | erased):
+        if not event_mask[pos] and not erased[pos]:
+            continue                     # Already consumed as a continuation
+        packet = packets[packet_index[pos]]
+        marker = dict(source=packet.source, offset=int(packet.header_offset + 20 + record_index[pos] * 8),
+                      kind="UNKNOWN", records=1, trigger_id=-1)
+        take = 1
+        if starts[pos]:
+            marker.update(kind="START", trigger_id=int(words[pos, 3]), flags=int(words[pos, 2]))
+        elif erased[pos]:
+            marker["kind"] = "ERASED"
+        elif heartbeats[pos] or ends[pos]:
+            complete = pos + 2 < n and not np.any(gaps[pos + 1:pos + 3])
+            if complete and heartbeats[pos]:
+                sec = low_word_first(words[pos + 1], 0)
+                ticks = low_word_first(words[pos + 1], 2)
+                complete = not np.any(starts[pos + 1:pos + 3] | ends[pos + 1:pos + 3]
+                                      | heartbeats[pos + 1:pos + 3] | erased[pos + 1:pos + 3])
+            elif complete:
+                sec = low_word_first(words[pos], 2)
+                ticks = low_word_first(words[pos + 1], 2)
+                complete = bool(continuations[pos + 1] and not
+                                (starts[pos + 2] or heartbeats[pos + 2] or ends[pos + 2] or erased[pos + 2]))
+            if complete:
+                value = float(mission_time(sec, ticks))
+                complete = np.isfinite(value) and (not np.isfinite(packet.time) or value <= packet.time + 1.0)
+            if complete:
+                take = 3
+                marker.update(kind="HEARTBEAT" if heartbeats[pos] else "END",
+                              gps_seconds=sec, pps_ticks=ticks,
+                              uptime_ticks=low_word_first(words[pos + 2], 0),
+                              dwt=low_word_first(words[pos + 2], 2), time=value)
+                if heartbeats[pos]:
+                    marker["event_count"] = low_word_first(words[pos], 2)
+                    anchors.append(dict(marker, position=int(pos)))
             else:
-                idx += 2
+                marker["kind"] = "INCOMPLETE_OR_UNSUPPORTED_MARKER"
+                segment_break[pos] = True
+                quality[pos + 1:min(n, pos + 3)] |= UNCERTAIN_RECORD | BAD_MARKER
+                segment_break[min(n - 1, pos + 2)] = True
+        else:
+            marker["kind"] = "ORPHAN_END_CONTINUATION"
+            quality[pos + 1:min(n, pos + 2)] |= UNCERTAIN_RECORD | BAD_MARKER
+            segment_break[pos] = True
+        marker["records"] = take
+        marker["raw_hex"] = words[pos:pos + take].tobytes().hex()
+        marker_rows.append(marker)
+        event_mask[pos:pos + take] = False
+        marker_mask[pos:pos + take] = True
+        if ends[pos] or continuations[pos]:
+            if pos + take < n:
+                group_break[pos + take] = True
+                segment_break[pos + take] = True
 
-        if packet_count >= FLUSH_THRESHOLD:
-            if "l1a" in levels:
-                flush_cache_to_disk(cache_a, "L1a")
-            if "l1b" in levels:
-                flush_cache_to_disk(cache_b, "L1b")
-            packet_count = 0
+    # A break in telemetry also prevents orphan marker continuations from
+    # acquiring a valid TIME by an accidental subsequent clock match.
+    for pos in np.flatnonzero(gaps):
+        quality[pos:min(n, pos + 2)] |= SEQUENCE_GAP | UNCERTAIN_RECORD
+    segment = np.cumsum(segment_break)
+    group = np.cumsum(group_break) - 1
+    group_trigger = np.full(int(group[-1]) + 1, -1, dtype=np.int64)
+    group_trigger[group[starts]] = words[starts, 3]
+    dwt = (words[:, 1].astype(np.int64) << 16) | (words[:, 2].astype(np.int64) & 0xFF00)
+    times = np.full(n, np.nan)
+    pairs = []
+    rejected = Counter()
 
-    if "l1a" in levels:
-        flush_cache_to_disk(cache_a, "L1a")
-    if "l1b" in levels:
-        flush_cache_to_disk(cache_b, "L1b")
-        
-    print(f"\n[PIPELINE COMPLETE] Valid Packets Parsed: {total_parsed}")
+    for left, right in zip(anchors, anchors[1:]):
+        lo, hi = left["position"] + 3, right["position"]
+        if segment[left["position"]] != segment[right["position"]]:
+            rejected["stream_break"] += 1
+            continue
+        ids = np.flatnonzero(event_mask[lo:hi]) + lo
+        elapsed = ((right["gps_seconds"] - left["gps_seconds"])
+                   + (right["pps_ticks"] - left["pps_ticks"]) / PPS_HZ)
+        span = (right["dwt"] - left["dwt"]) % DWT_CYCLE
+        uptime = (right["uptime_ticks"] - left["uptime_ticks"]) % 2**32 / 32.0
+        reason = None
+        if not 0 < elapsed <= MAX_ANCHOR_SPAN:
+            reason = "anchor_spacing"
+        elif (right["event_count"] - left["event_count"]) % 2**32 != len(ids):
+            reason = "event_count_mismatch"
+        elif abs(uptime - elapsed) > 0.07 + elapsed * CLOCK_TOLERANCE:
+            reason = "uptime_mismatch"
+        elif span <= 0 or abs(span / elapsed / DWT_HZ - 1) > CLOCK_TOLERANCE:
+            reason = "clock_mismatch"
+        delta = (dwt[ids] - left["dwt"]) % DWT_CYCLE
+        delta[delta >= DWT_CYCLE - DWT_QUANTUM] = 0  # Quantization at left boundary
+        if reason is None and (np.any(delta > span + DWT_QUANTUM)
+                               or np.any(np.diff(delta) < 0)
+                               or np.any(quality[ids] & UNCERTAIN_RECORD)):
+            reason = "event_clock_or_record_mismatch"
+        if reason:
+            rejected[reason] += 1
+            quality[ids] |= BAD_DWT
+            continue
+        times[ids] = left["time"] + np.minimum(delta, span) * (elapsed / span)
+        quality[ids] = 0
+        pairs.append(dict(start=left["time"], stop=right["time"], events=len(ids),
+                          clock_ppm=(span / elapsed / DWT_HZ - 1) * 1e6))
+
+    selected = np.flatnonzero(event_mask)
+    pids = packet_index[selected]
+    base = provenance(packets)
+    result = {key: value[pids] for key, value in base.items()}
+    result["BYTE_OFFSET"] += 20 + record_index[selected] * 8
+    result.update(TIME=times[selected], PHA=(words[selected, 0] & 0xFFF).astype(np.int16),
+                  ENERGY=np.full(len(selected), np.nan, dtype=np.float32),
+                  DEADTIME=words[selected, 3].astype(float) * DEADTIME_TICK,
+                  TIME_QUAL=quality[selected], RAW_ADC=words[selected, 0].astype(np.int64),
+                  DWT=dwt[selected], TSU_TICKS=(words[selected, 2] & 255).astype(np.int16),
+                  DEAD_TICKS=words[selected, 3].astype(np.int64),
+                  FLAGS=(words[selected, 0] >> 12).astype(np.uint8), GROUP=group[selected])
+    report = dict(input_records=n, events=len(selected),
+                  padding_records=int(np.sum(np.all(words == 0, axis=1) & ~marker_mask)),
+                  marker_records=sum(m["records"] for m in marker_rows),
+                  timed_events=int(np.sum(np.isfinite(result["TIME"]))),
+                  markers=marker_rows, accepted_pairs=pairs, rejected_pairs=dict(rejected))
+    if report["events"] + report["padding_records"] + report["marker_records"] != n:
+        raise ParseError("Photon record accounting failed")
+    return result, group_trigger, report
+
+
+# 7. Supplied calibration. Every pair is [slope, intercept], so y = slope*x + intercept.
+# Use the precise coefficients in the upper spreadsheet, with the C/V/mA
+# units in its lower section and the ICD. The upper K/A labels conflict.
+# The green "alt" rows directly calibrate the negative rails. The red rows
+# describe a voltage delta, not the negative-rail columns required by the ICD.
+HOUSEKEEPING_CALIBRATION = {
+    "TEMP_DET_0": (0.5432, -268.3),       # Detector Temp #1; degrees Celsius
+    "TEMP_DET_1": (0.5437, -268.7),       # Detector Temp #2; degrees Celsius
+    "AB1_VMON_10V_P": (0.0045, -2.4681), # volts
+    "AB1_VMON_10V_N": (0.0051, -23.963), # volts; green direct -10V row
+    "AB2_VMON_10V_P": (0.0048, -3.649),  # volts
+    "AB2_VMON_10V_N": (0.0051, -23.906), # volts; green direct -10V row
+    "DB1_IMON_5V": (0.1635, -0.7446),    # milliamperes
+    "DB2_IMON_5V": (0.1638, -0.9634),    # milliamperes
+}
+# TEMP_EXT has no supplied calibration; its raw ADC remains available.
+
+
+def default_calibration():
+    """Return independent, editable calibration dictionaries for both BTOs."""
+    return {
+        "caldb_version": "NONE",  # User-supplied coefficients, not a CALDB release
+        "calibration_id": "BTO_USER_20261112",
+        "source": "User-supplied housekeeping sheet and FM1 m2C (Cs) energy fit",
+        "notes": [
+            "User requested the FM1 energy relation for both BTO0 and BTO1.",
+            "Energy-fit temperature and validated ADC range were not supplied.",
+            "Energy coefficient uncertainties are retained; covariance is unknown.",
+            "HK units follow the lower sheet and ICD: C, V, mA; upper K/A labels conflict.",
+            "Negative rails use green direct -10V rows, not red delta rows.",
+            "TEMP_EXT and the 29-channel histogram boundaries were not supplied.",
+        ],
+        "detectors": {
+            str(detector): {
+                "energy": [0.924236, 0.7380],  # keV/ADU, keV
+                "energy_uncertainty": [0.000686, 0.4258],
+                "energy_source": "FM1 m2C (Cs)",
+                "housekeeping": {name: list(pair) for name, pair in HOUSEKEEPING_CALIBRATION.items()},
+            }
+            for detector in (0, 1)
+        },
+    }
+
+
+def detector_calibration(calibration, detector):
+    return calibration.get("detectors", {}).get(str(detector), {})
+
+
+def read_calibration(path=None):
+    """Use the supplied defaults, or replace them with an explicit JSON file."""
+    data = default_calibration() if path is None else json.loads(Path(path).read_text())
+    return validate_calibration(data)
+
+
+def validate_calibration(data):
+    """Reject malformed coefficients before creating an output archive."""
+    if not isinstance(data, dict):
+        raise ParseError("Calibration must be a JSON object")
+    if not data:  # An explicit empty object disables all calibration.
+        return data
+    if not isinstance(data.get("caldb_version"), str) or not data["caldb_version"]:
+        raise ParseError("Calibration needs a nonempty caldb_version")
+    if not isinstance(data.get("detectors", {}), dict):
+        raise ParseError("Calibration detectors must be an object")
+    if set(data.get("detectors", {})) - {"0", "1"}:
+        raise ParseError("Calibration detector keys must be 0 or 1")
+    for detector, values in data.get("detectors", {}).items():
+        if not isinstance(values, dict):
+            raise ParseError(f"Detector {detector}: calibration must be an object")
+        if "energy" in values:
+            coefficients = np.asarray(values["energy"], dtype=float)
+            if coefficients.shape != (2,) or not np.all(np.isfinite(coefficients)) or coefficients[0] <= 0:
+                raise ParseError(f"Detector {detector}: energy needs [positive slope, intercept]")
+        if "energy_uncertainty" in values:
+            errors = np.asarray(values["energy_uncertainty"], dtype=float)
+            if ("energy" not in values or errors.shape != (2,)
+                    or not np.all(np.isfinite(errors)) or np.any(errors < 0)):
+                raise ParseError(f"Detector {detector}: energy_uncertainty needs two nonnegative errors")
+        if not isinstance(values.get("housekeeping", {}), dict):
+            raise ParseError(f"Detector {detector}: housekeeping must be an object")
+        for name, coefficients in values.get("housekeeping", {}).items():
+            if name not in dict(SENSORS) or np.shape(coefficients) != (2,) or not np.all(np.isfinite(coefficients)):
+                raise ParseError(f"Detector {detector}: invalid housekeeping calibration {name}")
+        if not isinstance(values.get("histogram_modes", {}), dict):
+            raise ParseError(f"Detector {detector}: histogram_modes must be an object")
+        for mode, band in values.get("histogram_modes", {}).items():
+            if not isinstance(band, dict):
+                raise ParseError(f"Detector {detector}, mode {mode}: bin mapping must be an object")
+            edges = np.asarray(band.get("edges", []), dtype=float)
+            if (mode not in ("0", "1") or band.get("type") not in ("LINEAR", "LOG")
+                    or edges.shape != (30,) or np.any(~np.isfinite(edges))
+                    or np.any(edges != np.floor(edges)) or np.any(np.diff(edges) <= 0)
+                    or edges[0] < 0 or edges[-1] > 4096):
+                raise ParseError(f"Detector {detector}, mode {mode}: need 30 increasing ADC edges and type")
+    return data
+
+
+# 8. FITS columns and metadata. ICD columns always precede diagnostics.
+def column(name, values, form, unit=None, unsigned=False, null=None):
+    options = dict(name=name, array=values, format=form)
+    if unit:
+        options["unit"] = unit
+    if unsigned:
+        bits = 16 if form.endswith("I") else 32
+        options.update(array=np.asarray(values, dtype=f"uint{bits}"), bzero=2**(bits - 1))
+    if null is not None:
+        options["null"] = null
+    return fits.Column(**options)
+
+
+def make_table(name, data, schema):
+    """Schema entries: column name, FITS format, unit, unsigned flag."""
+    return fits.BinTableHDU.from_columns([
+        column(key, data[key], form, unit, unsigned,
+               -1 if key == "COUNT" and form == "3J" else None)
+        for key, form, unit, unsigned in schema], name=name)
+
+
+TRACE_SCHEMA = [("SOURCE_ID", "1J", None, False), ("BYTE_OFFSET", "1K", "byte", False),
+                ("PKT_TIME", "1D", "s", False)]
+HIST_SCHEMA = [("TIME", "1D", "s", False), ("PKT_CNT", "1I", None, False),
+               ("TIMEDEL", "1D", "s", False), ("COUNT", "29I", "count", True),
+               ("TIME_QUAL", "1I", None, False), ("DEADTIME", "1D", "s", False),
+               ("DEAD_TICKS", "1K", None, False), ("HIST_SEC", "1K", "s", False),
+               ("HIST_TICKS", "1K", None, False), ("BINMODE", "1B", None, False)] + TRACE_SCHEMA
+CTIME_SCHEMA = [("TIME", "1D", "s", False), ("PKT_CNT", "1I", None, False),
+                ("TIMEDEL", "1D", "s", False), ("COUNT", "3J", "count", False),
+                ("COUNTER_RAW", "3I", None, True), ("COUNT_QUAL", "1I", None, False),
+                ("TIME_QUAL", "1I", None, False), ("SAMPLE", "1I", None, False)] + TRACE_SCHEMA
+EVENT_SCHEMA = [("TIME", "1D", "s", False), ("PKT_CNT", "1I", None, False),
+                ("PHA", "1I", "chan", False), ("ENERGY", "1E", "keV", False),
+                ("DEADTIME", "1D", "s", False), ("TIME_QUAL", "1I", None, False),
+                ("RAW_ADC", "1I", None, True), ("DWT", "1K", "cycle", False),
+                ("TSU_TICKS", "1I", None, False), ("DEAD_TICKS", "1J", None, False),
+                ("FLAGS", "1B", None, False)] + TRACE_SCHEMA
+
+
+def set_headers(hdu, times, detector, obs_id, calibration, interval=0.0):
+    h = hdu.header
+    h.update(TELESCOP="COSI", INSTRUME="BTO", OBS_ID=obs_id, ORIGIN="SSL",
+             CREATOR=f"fits_parser.py {VERSION}", PROCVER=VERSION, SOFTVER=VERSION,
+             TLM2FITS=VERSION, CALDBVER=calibration.get("caldb_version", "NONE"),
+             SEQNUM=1, SEQPNUM=1, TIMESYS="TT", TIMEUNIT="s", MJDREFI=MJDREFI,
+             MJDREFF=MJDREFF, TIMEREF="LOCAL", TASSIGN="SATELLITE", CLOCKAPP=False,
+             DATE=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"))
+    h["DATLEVEL"] = ("L1", "Raw and calibrated columns in one product")
+    h["CALIBID"] = (calibration.get("calibration_id", "CUSTOM" if calibration else "NONE"),
+                    "Calibration identifier; independent of CALDBVER")
+    h["DETNAM"] = f"BTO{detector}" if detector in (0, 1) else "BTO0,BTO1"
+    detcal = detector_calibration(calibration, detector)
+    if "energy" in detcal:
+        h["ECSLOPE"] = (float(detcal["energy"][0]), "Energy slope in keV/ADU")
+        h["ECOFFSET"] = (float(detcal["energy"][1]), "Energy intercept in keV")
+        h["ECALNAME"] = detcal.get("energy_source", "CUSTOM")
+        if "energy_uncertainty" in detcal:
+            h["ECSLPERR"] = (float(detcal["energy_uncertainty"][0]), "Supplied slope uncertainty in keV/ADU")
+            h["ECOFFERR"] = (float(detcal["energy_uncertainty"][1]), "Supplied intercept uncertainty in keV")
+    for note in calibration.get("notes", []):
+        h["HISTORY"] = note
+    h.comments["MJDREFI"] = "Reference instant: 2025-01-01 00:00:00 UTC"
+    finite = np.asarray(times)[np.isfinite(times)]
+    if len(finite):
+        h["TSTART"] = float(finite.min() - interval)
+        h["TSTOP"] = float(finite.max())
+        h["DATE-OBS"] = utc_string(h["TSTART"])
+        h["DATE-END"] = utc_string(h["TSTOP"])
+    else:
+        h["TIMESTAT"] = "UNRESOLVED"
+    if isinstance(hdu, fits.BinTableHDU):
+        h["HDUCLASS"] = "OGIP"
+        h["HDUCLAS1"] = "TEMPORALDATA"
+        if "TIME" in hdu.columns.names:
+            h.comments[f"TTYPE{hdu.columns.names.index('TIME') + 1}"] = "SI seconds since 2025-01-01 00:00:00 UTC"
+    h["HISTORY"] = "Archive ICD 2026-11-10; unified L1 requested by user 2026-11-12."
+    h["HISTORY"] = "Original L0 binaries and source offsets are mapped in manifest.json."
+
+
+def empty_gti(name="GTI"):
+    """Telemetry alone does not establish screened science good-time intervals."""
+    hdu = fits.BinTableHDU.from_columns([
+        column("START", [], "1D", "s"), column("STOP", [], "1D", "s")], name=name)
+    hdu.header.update(HDUCLASS="OGIP", HDUCLAS1="GTI", HDUCLAS2="STANDARD",
+                      GTISTAT="NOT_SCREENED", OBSERVER="John Tomsick", DATAMODE="UNSCREENED")
+    hdu.header["COMMENT"] = "Empty GTI: apply observing-mode and quality screening downstream."
+    return hdu
+
+
+def energy_bands(detector, modes, calibration):
+    detcal = detector_calibration(calibration, detector)
+    mode = str(int(modes[0])) if len(modes) == 1 else "mixed"
+    band = detcal.get("histogram_modes", {}).get(mode, {})
+    edges = np.array(band.get("edges", []), dtype=int)
+    lower = edges[:-1] if len(edges) else np.full(29, -1)
+    upper = edges[1:] - 1 if len(edges) else np.full(29, -1)
+    e_min, e_max = np.full(29, np.nan), np.full(29, np.nan)
+    if len(edges) and "energy" in detcal:
+        slope, intercept = detcal["energy"]
+        e_min = slope * (edges[:-1] - 0.5) + intercept
+        e_max = slope * (edges[1:] - 0.5) + intercept
+    hdu = fits.BinTableHDU.from_columns([
+        column("MINCHAN", lower, "1I", null=-1), column("MAXCHAN", upper, "1I", null=-1),
+        column("E_MIN", e_min, "1E", "keV"), column("E_MAX", e_max, "1E", "keV")],
+        name=f"CSPEC_ENEBAND{detector}")
+    hdu.header.update(HDUCLASS="OGIP", HDUCLAS1="RESPONSE", HDUCLAS2="EBOUNDS",
+                      BINTYPE=band.get("type", "UNKNOWN"),
+                      CALSTAT="APPLIED" if np.all(np.isfinite(e_min)) else "UNAVAILABLE")
+    return hdu
+
+
+def write_fits(path, hdus):
+    """A failed write is an exception; it is never reported as a success."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with fits.HDUList(hdus) as product:
+        product.writeto(path, checksum=True, output_verify="exception")
+
+
+def date_groups(times, fallback):
+    routed = np.where(np.isfinite(times), times, fallback)
+    # Vectorized UTC conversion is much faster than one Astropy call per row.
+    days = np.full(len(routed), "undated", dtype="U8")
+    good = np.isfinite(routed)
+    if np.any(good):
+        dates = Time(GPS_AT_MET_ZERO + routed[good], format="gps").utc.isot
+        days[good] = [d[:10].replace("-", "") for d in dates]
+    for day in np.unique(days):
+        yield str(day), np.flatnonzero(days == day)
+
+
+def write_histograms(root, packets, detector, calibration, products):
+    hist, lc = decode_histograms(packets)
+    for day, ids in date_groups(hist["TIME"], hist["PKT_TIME"]):
+        data = subset(hist, ids)
+        data = subset(data, time_order(data["TIME"]))
+        lc_ids = (ids[:, None] * 10 + np.arange(10)[None, :]).ravel()
+        ctime = subset(lc, lc_ids)
+        ctime = subset(ctime, time_order(ctime["TIME"]))
+        spectrum = make_table(f"BTO{detector}_CSPEC", data, HIST_SCHEMA)
+        bands = energy_bands(detector, np.unique(data["BINMODE"]), calibration)
+        lightcurve = make_table(f"BTO{detector}_CTIME", ctime, CTIME_SCHEMA)
+        hdus = [fits.PrimaryHDU(), spectrum, bands, lightcurve, empty_gti("BTO_GTI")]
+        for hdu in hdus:
+            set_headers(hdu, data["TIME"], detector, day, calibration, interval=1.0)
+        # Restore extension classification after common metadata is installed.
+        bands.header.update(HDUCLAS1="RESPONSE", HDUCLAS2="EBOUNDS")
+        hdus[-1].header["HDUCLAS1"] = "GTI"
+        spectrum.header.update(HDUCLAS2="EVRATE", TIMEDEL=1.0, TIMEPIXR=1.0,
+                               DEADAPP=True, BINTYPE=bands.header["BINTYPE"], DTTICK=DEADTIME_TICK)
+        set_headers(lightcurve, ctime["TIME"], detector, day, calibration, interval=0.1)
+        lightcurve.header.update(HDUCLAS2="EVRATE", TIMEDEL=0.1, TIMEPIXR=1.0,
+                                 DEADAPP=False, BINTYPE="DISCRIM", COUNTMTH="MODULO",
+                                 CHAN1="ZERO_CROSSING", CHAN2="UPPER", CHAN3="SUPER_UPPER")
+        lightcurve.header["COMMENT"] = "COUNT is minimum modulo increment; multiple counter wraps are unresolved."
+        lightcurve.header["COMMENT"] = "No per-100ms deadtime is available. TIMEDEL is nominal 0.1 s."
+        lightcurve.header["COMMENT"] = "COUNT_QUAL=1: first counter difference is unavailable; COUNT=-1."
+        path = root / "L1" / day / "bto" / f"cs{day}bto{detector}_spec_lc.fits"
+        write_fits(path, hdus)
+        products.append(dict(path=str(path.relative_to(root)), kind="spectral_lightcurve", detector=detector,
+                             cspec_rows=len(ids), ctime_rows=len(ctime["TIME"]),
+                             invalid_deadtime=int(np.sum(~np.isfinite(data["TIMEDEL"]))),
+                             unknown_time=int(np.sum(~np.isfinite(data["TIME"])))))
+
+
+def write_housekeeping(root, packets, calibration, products):
+    table = decode_housekeeping(packets, calibration)
+    first = [("TIME", "1D", "s", False), ("BTO_MODE", "1B", None, False),
+             ("UPTIME_TICKS", "1J", None, True), ("LAST_GRB_TIME", "1D", "s", False),
+             ("LAST_GRB_ID", "1J", None, True), ("ZERO_CROSSING_COUNT", "1I", None, True),
+             ("SUPPER_UPPER_COUNT", "1I", None, True)]
+    first += [(name, "1E", unit, False) for name, unit in SENSORS]
+    extra = [("BTO_ID", "1B", None, False), ("PKT_CNT", "1I", None, False),
+             ("TIME_QUAL", "1I", None, False)]
+    used = {item[0] for item in first + extra + TRACE_SCHEMA}
+    extra += [(name, "1K", None, False) for name in table if name not in used]
+    for day, ids in date_groups(table["TIME"], table["PKT_TIME"]):
+        data = subset(table, ids)
+        data = subset(data, time_order(data["TIME"]))
+        # Keep the literal draft EXTNAME. BTO_ID identifies the detector in
+        # this one combined housekeeping extension; the name is not a filter.
+        hdu = make_table("BTO0_HSK", data, first + extra + TRACE_SCHEMA)
+        hdus = [fits.PrimaryHDU(), hdu]
+        for item in hdus:
+            set_headers(item, data["TIME"], None, day, calibration)
+        present = np.unique(data["BTO_ID"])
+        applied = [name in detector_calibration(calibration, int(det)).get("housekeeping", {})
+                   for det in present for name, _ in SENSORS]
+        status = "APPLIED" if all(applied) else "PARTIAL" if any(applied) else "UNAVAILABLE"
+        hdu.header.update(HDUCLAS2="HKP", CALSTAT=status)
+        for det in present:
+            coefficients = detector_calibration(calibration, int(det)).get("housekeeping", {})
+            for name, unit in SENSORS:
+                if name in coefficients:
+                    slope, intercept = coefficients[name]
+                    hdu.header["HISTORY"] = (
+                        f"BTO{det} {name} = {slope:g}*ADC {intercept:+g} {unit}")
+        hdu.header["COMMENT"] = "BTO0_HSK is the ICD table name; select rows using BTO_ID."
+        hdu.header["COMMENT"] = "Calibrated sensors and their original *_ADC columns are stored together."
+        hdu.header["COMMENT"] = "Missing sensor coefficients produce NaN; see CALSTAT and manifest.json."
+        path = root / "L1" / day / "auxil" / f"cs{day}bto_gen.hk.fits"
+        write_fits(path, hdus)
+        products.append(dict(path=str(path.relative_to(root)), kind="housekeeping", rows=len(ids)))
+
+
+def write_events(root, packets, detector, calibration, products):
+    data, triggers, diagnostics = decode_events(packets)
+    detcal = detector_calibration(calibration, detector)
+    if "energy" in detcal:
+        slope, intercept = detcal["energy"]
+        data["ENERGY"] = (data["PHA"] * slope + intercept).astype(np.float32)
+    groups = []
+    for group in np.unique(data["GROUP"]):
+        ids = np.flatnonzero(data["GROUP"] == group)
+        valid = data["TIME"][ids]
+        valid = valid[np.isfinite(valid)]
+        fallback = data["PKT_TIME"][ids]
+        fallback = fallback[np.isfinite(fallback)]
+        route_time = float(valid.min()) if len(valid) else float(fallback.min()) if len(fallback) else np.nan
+        groups.append((route_time, int(group), ids))
+    groups.sort(key=lambda item: item[0] if np.isfinite(item[0]) else np.inf)
+    daily_number = Counter()
+    for route_time, group, ids in groups:
+        day = date_key(route_time)
+        daily_number[day] += 1
+        if daily_number[day] > 999:
+            raise ParseError(f"More than 999 event groups on {day}; ICD filename field exhausted")
+        number = daily_number[day]
+        obs_id = f"{day}{number:03d}t"
+        rows = subset(data, ids)
+        rows = subset(rows, time_order(rows["TIME"]))
+        hdu = make_table("BTO_EVENT", rows, EVENT_SCHEMA)
+        hdus = [fits.PrimaryHDU(), hdu, empty_gti()]
+        for item in hdus:
+            set_headers(item, rows["TIME"], detector, obs_id, calibration)
+            item.header["GRB_ID"] = (int(triggers[group]), "Onboard START ID; -1 if START is absent")
+        hdu.header.update(HDUCLAS1="EVENT", HDUCLAS2="ALL", DEADAPP=False,
+                          DTTICK=DEADTIME_TICK, DWTRES=DWT_QUANTUM / DWT_HZ,
+                          TIMEMETH="HEARTBEAT_PAIRS", CALSTAT="APPLIED" if "energy" in detcal else "UNAVAILABLE",
+                          NTIMED=int(np.sum(np.isfinite(rows["TIME"]))),
+                          NUNTIMED=int(np.sum(~np.isfinite(rows["TIME"]))),
+                          ROUTETIM="EVENT" if np.any(np.isfinite(rows["TIME"])) else "PACKET")
+        hdus[-1].header["HDUCLAS1"] = "GTI"
+        if "energy" in detcal:
+            slope, intercept = detcal["energy"]
+            hdu.header.update(E_MIN=float(intercept), E_MAX=float(4095 * slope + intercept))
+        hdu.header["COMMENT"] = "TIME_QUAL bits: 1 clock,2 gap,4 no anchor,8 marker,16 DWT,32 ambiguous record."
+        hdu.header["COMMENT"] = "PKT_TIME is transmission time and is never a substitute for event TIME."
+        hdu.header["COMMENT"] = "FLAGS bits 0/1/2/3: pseudo/lower/upper/super-upper. PHA is unsigned 12-bit ADC."
+        date_part = day[2:] if day != "undated" else day
+        filename = f"cs{date_part}{number:03d}tbto{detector}_evt.fits"
+        path = root / "L1" / day / "bto" / filename
+        write_fits(path, hdus)
+        products.append(dict(path=str(path.relative_to(root)), kind="events", detector=detector,
+                             rows=len(ids), onboard_trigger_id=int(triggers[group]),
+                             timed=hdu.header["NTIMED"], untimed=hdu.header["NUNTIMED"]))
+    return diagnostics
+
+
+# 9. Batch execution. A run replaces a whole managed archive; it never appends.
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def is_excluded_path(path, output):
+    """Exclude the target output archive and any temporary staging directories."""
+    stage_prefix = f".{output.name}-building-"
+    for parent in (path, *path.parents):
+        if parent == output or (parent.parent == output.parent and parent.name.startswith(stage_prefix)):
+            return True
+    return False
+
+
+def collect_inputs(targets, output, recursive=False):
+    files = set()
+    for target in targets:
+        path = Path(target).expanduser().resolve()
+        if path.is_file():
+            if path.suffix.lower() != ".bin":
+                raise ParseError(f"Expected a .bin file: {path}")
+            files.add(path)
+        elif path.is_dir():
+            candidates = path.rglob("*.bin") if recursive else path.glob("*.bin")
+            files.update(p.resolve() for p in candidates if not is_excluded_path(p.resolve(), output))
+        else:
+            raise ParseError(f"Input does not exist: {path}")
+    if not files:
+        raise ParseError("No .bin files found")
+    if any(is_excluded_path(p, output) for p in files):
+        raise ParseError("Input files must be outside the output archive")
+    return sorted(files)
+
+
+def build_archive(paths, output, *, overwrite=False, framing="auto", checksum="absent",
+                  calibration=None, level="l1"):
+    if level not in ("l0", "l1", "all"):
+        raise ParseError("Level must be l0, l1 or all; only unified L1 is supported")
+    level = "l1" if level == "all" else level
+    calibration = read_calibration() if calibration is None else validate_calibration(calibration)
+    if Path(output).is_symlink():
+        raise ParseError("Output directory must not be a symbolic link")
+    output = Path(output).resolve()
+    if any(is_excluded_path(Path(p).resolve(), output) for p in paths):
+        raise ParseError("Input files must be outside the output archive")
+    if output.exists():
+        manifest = output / "manifest.json"
+        if not overwrite:
+            raise ParseError(f"Output exists: {output}. Use --overwrite to rebuild it.")
+        if (not manifest.is_file() or json.loads(manifest.read_text()).get("archive_format")
+                not in (ARCHIVE_FORMAT, PREVIOUS_ARCHIVE_FORMAT)):
+            raise ParseError("--overwrite only replaces an archive created by this parser")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{output.name}-building-", dir=output.parent))
+    report = dict(archive_format=ARCHIVE_FORMAT, parser_version=VERSION, inputs=[], products=[],
+                  duplicates_skipped=[], packet_counts={}, sequence_gaps={}, photon_diagnostics={})
+    report["settings"] = dict(framing=framing, checksum=checksum, level=level,
+                              deadtime_tick_seconds=DEADTIME_TICK, pps_hz=PPS_HZ, dwt_hz=DWT_HZ,
+                              maximum_anchor_span_seconds=MAX_ANCHOR_SPAN,
+                              clock_tolerance_ppm=CLOCK_TOLERANCE * 1e6)
+    report["limitations"] = [
+        "FITS GTIs are empty until science screening is performed.",
+        "CTIME uses nominal 0.1 s widths; per-bin deadtime is not in the packets.",
+        "CTIME counts are minimum modulo increments; multiple wraps cannot be recovered.",
+        "TEMP_EXT is uncalibrated unless its coefficients are explicitly supplied.",
+        "Histogram channel/energy boundaries require the firmware's 30 ADC bin edges.",
+        "Supplied HK unit labels conflict; output uses C, V, mA as in the lower sheet and ICD.",
+        "Energy-fit temperature, validity range and coefficient covariance were not supplied.",
+        "Only current three-record D7 heartbeats are timed; unsupported markers remain flagged.",
+    ]
+    streams = defaultdict(list)
+    previous = {}
+    seen_hashes = {}
+    counts, gaps = Counter(), Counter()
+    try:
+        for path in paths:
+            digest = sha256_file(path)
+            source = len(report["inputs"])
+            # A separate source directory preserves original names, even on collisions.
+            relative = Path("L0") / f"{source:04d}" / path.name
+            copied = stage / relative
+            copied.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, copied)
+            if sha256_file(copied) != digest:
+                raise ParseError(f"Input changed while being copied: {path}")
+            report["inputs"].append(dict(source_id=source, name=path.name, sha256=digest,
+                                         bytes=copied.stat().st_size, archived_path=str(relative)))
+            if digest in seen_hashes:
+                # Archive every original file; decode identical bytes only once into L1.
+                original = seen_hashes[digest]
+                report["inputs"][-1].update(duplicate_of=original,
+                                            packets=report["inputs"][original]["packets"])
+                report["duplicates_skipped"].append(str(path))  # L1 decoding only
+                continue
+            seen_hashes[digest] = source
+            print(f"Reading {path.name}", flush=True)
+            source_packets = 0
+            for packet in read_packets(copied, source, framing, checksum):
+                source_packets += 1
+                key = f"0x{packet.apid:03X}"
+                counts[key] += 1
+                if packet.apid not in SCIENCE_APIDS:
+                    continue             # Exact bytes retained in L0; no invented FITS schema
+                identity = packet.apid, packet.detector
+                if identity in previous:
+                    packet.gap = packet.sequence != (previous[identity] + 1) % 16384
+                previous[identity] = packet.sequence
+                if packet.gap:
+                    gaps[f"{key}/BTO{packet.detector}"] += 1
+                if level != "l0":
+                    streams[identity].append(packet)
+            if not source_packets:
+                raise ParseError(f"Empty telemetry file: {path}")
+            report["inputs"][-1]["packets"] = source_packets
+        report["packet_counts"], report["sequence_gaps"] = dict(counts), dict(gaps)
+        for detector in (0, 1):
+            packets = streams.pop((0xD6, detector), [])
+            if packets:
+                print(f"Writing BTO{detector} spectral/lightcurve files", flush=True)
+                write_histograms(stage, packets, detector, calibration, report["products"])
+        hk = streams.pop((0xD8, 0), []) + streams.pop((0xD8, 1), [])
+        if hk:
+            print("Writing housekeeping files", flush=True)
+            write_housekeeping(stage, hk, calibration, report["products"])
+        del hk
+        for detector in (0, 1):
+            packets = streams.pop((0xD7, detector), [])
+            if packets:
+                print(f"Writing BTO{detector} event files", flush=True)
+                report["photon_diagnostics"][str(detector)] = write_events(
+                    stage, packets, detector, calibration, report["products"])
+        report["calibration"] = calibration
+        (stage / "manifest.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+        backup = None
+        if output.exists():
+            backup = stage.parent / (stage.name + "-previous")
+            output.rename(backup)
+        try:
+            stage.rename(output)
+        except Exception:
+            if backup is not None:
+                backup.rename(output)
+            raise
+        if backup is not None:
+            shutil.rmtree(backup)
+    except Exception:
+        print(f"Run failed. Partial files are retained at {stage}; they are not a completed archive.", file=sys.stderr)
+        raise
+    return report
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("files", nargs="*", help="Binary files or directories")
+    parser.add_argument("--input", nargs="+", default=[], help="Binary files or directories (alternative syntax)")
+    parser.add_argument("-o", "--output", "--output-dir", dest="output_dir",
+                        default="BTO_FITS_Archive", help="Archive directory")
+    parser.add_argument("--recursive", action="store_true", help="Include .bin files in input subdirectories")
+    parser.add_argument("--overwrite", action="store_true", help="Rebuild a managed archive from all selected inputs")
+    parser.add_argument("--framing", choices=["auto", "ccsds", "sync"], default="auto", help="auto detects optional EB90")
+    parser.add_argument("--checksum", choices=["absent", "required"], default="absent", help="External BTO XOR16; absent in samples")
+    parser.add_argument("--calibration", type=Path, help="JSON replacing the supplied energy/housekeeping defaults")
+    parser.add_argument("--level", choices=["l0", "l1", "all"], default="l1",
+                        help="l0 preserves binaries; l1/all also writes raw+calibrated FITS")
+    parser.add_argument("--version", action="version", version=VERSION)
+    args = parser.parse_args(argv)
+    try:
+        output_arg = Path(args.output_dir).expanduser()
+        if output_arg.is_symlink():
+            raise ParseError("Output directory must not be a symbolic link")
+        output = output_arg.resolve()
+        targets = args.files + args.input
+        if not targets:
+            parser.error("provide --input or positional .bin files")
+        paths = collect_inputs(targets, output, args.recursive)
+        report = build_archive(paths, output, overwrite=args.overwrite, framing=args.framing,
+                               checksum=args.checksum, calibration=read_calibration(args.calibration), level=args.level)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    print(f"Wrote {len(report['products'])} FITS files to {output}")
+    for detector, item in report["photon_diagnostics"].items():
+        print(f"BTO{detector}: {item['events']:,} events; {item['timed_events']:,} with validated relative clock timing")
+    print("See manifest.json for input hashes, packet counts, timing diagnostics and limitations.")
+    return 0
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--level", default="all", choices=["l0", "l1a", "l1b", "all"])
-    parser.add_argument("--live", choices=["yes", "no"], default="no")
-    args = parser.parse_args()
-
-    run_pipeline(
-        args.input,
-        ["l0", "l1a", "l1b"] if args.level == "all" else [args.level],
-        args.live == "yes",
-    )
+    raise SystemExit(main())
