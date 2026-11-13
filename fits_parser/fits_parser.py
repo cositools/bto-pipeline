@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Read BTO binary telemetry and write traceable FITS products.
+Read BTO binary telemetry and write the BTO subset of the COSI archive.
 
 """
 
@@ -12,7 +12,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
+import re
 import shutil
 import struct
 import sys
@@ -24,9 +26,9 @@ from astropy.time import Time
 
 
 # 1. Constants. Keep firmware-dependent assumptions together for review.
-VERSION = "4.0.1"
-ARCHIVE_FORMAT = "BTO_BINARY_FITS_V4"
-PREVIOUS_ARCHIVE_FORMAT = "BTO_BINARY_FITS_V3"
+VERSION = "6.0.0"
+ARCHIVE_FORMAT = "BTO_BINARY_FITS_V6"
+PREVIOUS_ARCHIVE_FORMATS = ("BTO_BINARY_FITS_V3", "BTO_BINARY_FITS_V4", "BTO_BINARY_FITS_V5")
 GPS_AT_MET_ZERO = 1_419_724_818       # 2025-01-01 00:00:00 UTC
 MJDREFI = 60676
 MJDREFF = 69.184 / 86400.0          # The same reference instant, expressed in TT
@@ -35,7 +37,7 @@ DWT_HZ = 300_000_000
 DWT_CYCLE = 2**32                  # Only the upper 24 DWT bits are in events
 DWT_QUANTUM = 256                  # One event-clock step, in 300 MHz cycles
 DEADTIME_TICK = 0.5e-6             # seconds per telemetry deadtime tick
-MAX_ANCHOR_SPAN = 6.0             # Less than half the 14.3166 s DWT cycle
+MAX_ANCHOR_SPAN = 14.0            # Two absolute anchors resolve almost one full DWT cycle
 CLOCK_TOLERANCE = 100e-6           # Allowed fractional clock-rate difference
 SYNC = b"\xeb\x90"
 SCIENCE_APIDS = (0xD6, 0xD7, 0xD8)
@@ -49,6 +51,8 @@ BAD_MARKER = 8
 BAD_DWT = 16
 UNCERTAIN_RECORD = 32
 BAD_DEADTIME = 64
+COUNT_MISMATCH = 128              # Timed, but heartbeat event count disagrees
+BRIDGED_ANCHOR = 256              # Timed across an inconsistent intermediate clock sample
 
 # Python < 3.10 compatibility: dataclass(slots=True) was added in Python 3.10.
 DATACLASS_SLOTS = {"slots": True} if sys.version_info >= (3, 10) else {}
@@ -250,7 +254,7 @@ HK_FIELDS = [
     ("FLASH_ERASE_FAIL", 46, "H"), ("LAST_GRB_TIME_RAW", 48, "I"),
     ("LAST_GRB_NAND", 52, "I"), ("LAST_GRB_ID", 56, "I"),
     ("ZERO_CROSSING_COUNT", 60, "H"), ("SUPPER_UPPER_COUNT", 62, "H"),
-    ("TEMP_EXT_ADC", 64, "H"), ("TEMP_DET_0_ADC", 66, "H"), ("TEMP_DET_1_ADC", 68, "H"),
+    ("TEMP_EXT_ADC", 64, "H"), ("TEMP_DET_1_ADC", 66, "H"), ("TEMP_DET_2_ADC", 68, "H"),
     ("AB1_VMON_10V_P_ADC", 70, "H"), ("AB1_VMON_10V_N_ADC", 72, "H"),
     ("AB2_VMON_10V_P_ADC", 74, "H"), ("AB2_VMON_10V_N_ADC", 76, "H"),
     ("DB1_IMON_5V_ADC", 78, "H"), ("DB2_IMON_5V_ADC", 80, "H"),
@@ -294,7 +298,7 @@ def decode_events(packets):
     """Decode the current three-record heartbeat format used by the samples.
 
     START contains trigger flags and an ID, NOT a timestamp. Events receive
-    TIME only between two consistent heartbeat anchors. Counter wrap cannot
+    TIME only between consistent heartbeat or END anchors. Counter wrap cannot
     be resolved by simply adding the nearest modulo difference repeatedly.
     """
     for p in packets:
@@ -355,7 +359,7 @@ def decode_events(packets):
                               dwt=low_word_first(words[pos + 2], 2), time=value)
                 if heartbeats[pos]:
                     marker["event_count"] = low_word_first(words[pos], 2)
-                    anchors.append(dict(marker, position=int(pos)))
+                anchors.append(dict(marker, position=int(pos)))
             else:
                 marker["kind"] = "INCOMPLETE_OR_UNSUPPORTED_MARKER"
                 segment_break[pos] = True
@@ -385,42 +389,75 @@ def decode_events(packets):
     group_trigger[group[starts]] = words[starts, 3]
     dwt = (words[:, 1].astype(np.int64) << 16) | (words[:, 2].astype(np.int64) & 0xFF00)
     times = np.full(n, np.nan)
+    timing_pair = np.full(n, -1, dtype=np.int32)
     pairs = []
     rejected = Counter()
 
-    for left, right in zip(anchors, anchors[1:]):
+    # A pair of absolute clock anchors bounds the event time to ONE DWT cycle.
+    # The old half-cycle limit was needed for nearest-wrap guesses, not for
+    # this bracketed reconstruction. Try a wider bracket when a single marker
+    # has an inconsistent clock sample; never bridge a telemetry/reset break.
+    # Event counts are a diagnostic, not a clock: missing one photon cannot
+    # change the timestamp encoded in every other photon's DWT field.
+    candidates = []
+    for left_index, left in enumerate(anchors[:-1]):
+        for right_index in range(left_index + 1, len(anchors)):
+            right = anchors[right_index]
+            if segment[left["position"]] != segment[right["position"]]:
+                break
+            elapsed = ((right["gps_seconds"] - left["gps_seconds"])
+                       + (right["pps_ticks"] - left["pps_ticks"]) / PPS_HZ)
+            if elapsed > MAX_ANCHOR_SPAN:
+                break
+            if elapsed <= 0:
+                continue
+            candidates.append((right_index - left_index, left_index, right_index, elapsed))
+
+    # Closest brackets win. Wider pairs only fill rows still missing a time.
+    # This also handles an interrupt writing a photon just across a marker.
+    skipped_anchors = set()
+    count_warnings = []
+    for separation, left_index, right_index, elapsed in sorted(candidates):
+        left, right = anchors[left_index], anchors[right_index]
         lo, hi = left["position"] + 3, right["position"]
-        if segment[left["position"]] != segment[right["position"]]:
-            rejected["stream_break"] += 1
-            continue
         ids = np.flatnonzero(event_mask[lo:hi]) + lo
-        elapsed = ((right["gps_seconds"] - left["gps_seconds"])
-                   + (right["pps_ticks"] - left["pps_ticks"]) / PPS_HZ)
+        if not np.any(~np.isfinite(times[ids])):
+            continue
         span = (right["dwt"] - left["dwt"]) % DWT_CYCLE
         uptime = (right["uptime_ticks"] - left["uptime_ticks"]) % 2**32 / 32.0
-        reason = None
-        if not 0 < elapsed <= MAX_ANCHOR_SPAN:
-            reason = "anchor_spacing"
-        elif (right["event_count"] - left["event_count"]) % 2**32 != len(ids):
-            reason = "event_count_mismatch"
-        elif abs(uptime - elapsed) > 0.07 + elapsed * CLOCK_TOLERANCE:
-            reason = "uptime_mismatch"
-        elif span <= 0 or abs(span / elapsed / DWT_HZ - 1) > CLOCK_TOLERANCE:
-            reason = "clock_mismatch"
-        delta = (dwt[ids] - left["dwt"]) % DWT_CYCLE
-        delta[delta >= DWT_CYCLE - DWT_QUANTUM] = 0  # Quantization at left boundary
-        if reason is None and (np.any(delta > span + DWT_QUANTUM)
-                               or np.any(np.diff(delta) < 0)
-                               or np.any(quality[ids] & UNCERTAIN_RECORD)):
-            reason = "event_clock_or_record_mismatch"
-        if reason:
-            rejected[reason] += 1
-            quality[ids] |= BAD_DWT
+        if abs(uptime - elapsed) > 0.07 + elapsed * CLOCK_TOLERANCE:
+            rejected["uptime_mismatch"] += 1
             continue
-        times[ids] = left["time"] + np.minimum(delta, span) * (elapsed / span)
-        quality[ids] = 0
-        pairs.append(dict(start=left["time"], stop=right["time"], events=len(ids),
-                          clock_ppm=(span / elapsed / DWT_HZ - 1) * 1e6))
+        # Allow two microseconds for quantization/readout on very short pairs.
+        if span <= 0 or abs(span / DWT_HZ - elapsed) > 2e-6 + elapsed * CLOCK_TOLERANCE:
+            rejected["clock_mismatch"] += 1
+            continue
+        delta = (dwt[ids] - left["dwt"]) % DWT_CYCLE
+        delta[delta >= DWT_CYCLE - DWT_QUANTUM] = 0
+        if (np.any(delta > span + DWT_QUANTUM) or np.any(np.diff(delta) < 0)
+                or np.any(quality[ids] & UNCERTAIN_RECORD)):
+            rejected["event_clock_or_record_mismatch"] += 1
+            continue
+        flags = 0
+        if "event_count" in left and "event_count" in right:
+            expected = (right["event_count"] - left["event_count"]) % 2**32
+            if expected != len(ids):
+                flags |= COUNT_MISMATCH
+                count_warnings.append(dict(left=left["offset"], right=right["offset"],
+                                           expected=expected, received=len(ids)))
+        if right_index > left_index + 1:
+            flags |= BRIDGED_ANCHOR
+            skipped_anchors.update(range(left_index + 1, right_index))
+        untimed = ~np.isfinite(times[ids])
+        chosen = ids[untimed]
+        times[chosen] = left["time"] + np.minimum(delta[untimed], span) * (elapsed / span)
+        quality[chosen] = flags
+        timing_pair[chosen] = len(pairs)
+        if len(chosen):
+            pairs.append(dict(start=left["time"], stop=right["time"], events=len(chosen),
+                              left_offset=left["offset"], right_offset=right["offset"],
+                              source=left["source"], right_source=right["source"], flags=flags,
+                              clock_ppm=(span / elapsed / DWT_HZ - 1) * 1e6))
 
     selected = np.flatnonzero(event_mask)
     pids = packet_index[selected]
@@ -430,7 +467,8 @@ def decode_events(packets):
     result.update(TIME=times[selected], PHA=(words[selected, 0] & 0xFFF).astype(np.int16),
                   ENERGY=np.full(len(selected), np.nan, dtype=np.float32),
                   DEADTIME=words[selected, 3].astype(float) * DEADTIME_TICK,
-                  TIME_QUAL=quality[selected], RAW_ADC=words[selected, 0].astype(np.int64),
+                  TIME_QUAL=quality[selected], TIMING_PAIR=timing_pair[selected],
+                  RAW_ADC=words[selected, 0].astype(np.int64),
                   DWT=dwt[selected], TSU_TICKS=(words[selected, 2] & 255).astype(np.int16),
                   DEAD_TICKS=words[selected, 3].astype(np.int64),
                   FLAGS=(words[selected, 0] >> 12).astype(np.uint8), GROUP=group[selected])
@@ -438,7 +476,9 @@ def decode_events(packets):
                   padding_records=int(np.sum(np.all(words == 0, axis=1) & ~marker_mask)),
                   marker_records=sum(m["records"] for m in marker_rows),
                   timed_events=int(np.sum(np.isfinite(result["TIME"]))),
-                  markers=marker_rows, accepted_pairs=pairs, rejected_pairs=dict(rejected))
+                  markers=marker_rows, accepted_pairs=pairs, rejected_pairs=dict(rejected),
+                  bridged_anchor_offsets=[anchors[i]["offset"] for i in sorted(skipped_anchors)],
+                  count_warnings=count_warnings)
     if report["events"] + report["padding_records"] + report["marker_records"] != n:
         raise ParseError("Photon record accounting failed")
     return result, group_trigger, report
@@ -450,8 +490,8 @@ def decode_events(packets):
 # The green "alt" rows directly calibrate the negative rails. The red rows
 # describe a voltage delta, not the negative-rail columns required by the ICD.
 HOUSEKEEPING_CALIBRATION = {
-    "TEMP_DET_0": (0.5432, -268.3),       # Detector Temp #1; degrees Celsius
-    "TEMP_DET_1": (0.5437, -268.7),       # Detector Temp #2; degrees Celsius
+    "TEMP_DET_1": (0.5432, -268.3),       # Detector Temp #1; degrees Celsius
+    "TEMP_DET_2": (0.5437, -268.7),       # Detector Temp #2; degrees Celsius
     "AB1_VMON_10V_P": (0.0045, -2.4681), # volts
     "AB1_VMON_10V_N": (0.0051, -23.963), # volts; green direct -10V row
     "AB2_VMON_10V_P": (0.0048, -3.649),  # volts
@@ -466,21 +506,23 @@ def default_calibration():
     """Return independent, editable calibration dictionaries for both BTOs."""
     return {
         "caldb_version": "NONE",  # User-supplied coefficients, not a CALDB release
-        "calibration_id": "BTO_USER_20261112",
-        "source": "User-supplied housekeeping sheet and FM1 m2C (Cs) energy fit",
+        "calibration_id": "BTO_17C_20261113",
+        "source": "User-supplied housekeeping sheet and separate BTO1/BTO2 17C energy fits",
         "notes": [
-            "User requested the FM1 energy relation for both BTO0 and BTO1.",
-            "Energy-fit temperature and validated ADC range were not supplied.",
+            "Packet ID 0 is BTO1; packet ID 1 is BTO2. Energy fits were measured at 17 C.",
+            "No temperature-dependent gain correction or validated ADC range was supplied.",
             "Energy coefficient uncertainties are retained; covariance is unknown.",
             "HK units follow the lower sheet and ICD: C, V, mA; upper K/A labels conflict.",
             "Negative rails use green direct -10V rows, not red delta rows.",
             "TEMP_EXT and the 29-channel histogram boundaries were not supplied.",
         ],
         "detectors": {
-            str(detector): {
-                "energy": [0.924236, 0.7380],  # keV/ADU, keV
-                "energy_uncertainty": [0.000686, 0.4258],
-                "energy_source": "FM1 m2C (Cs)",
+            str(detector + 1): {
+                "energy": [[0.819876, 3.0631], [0.901133, 0.3974]][detector],
+                "energy_uncertainty": [[0.000601, 0.5580], [0.000661, 0.4637]][detector],
+                "energy_source": f"BTO{detector + 1} at 17 C",
+                "energy_temperature_c": 17.0,
+                "energy_reduced_chi2": [28.2616, 11.9507][detector],
                 "housekeeping": {name: list(pair) for name, pair in HOUSEKEEPING_CALIBRATION.items()},
             }
             for detector in (0, 1)
@@ -489,7 +531,7 @@ def default_calibration():
 
 
 def detector_calibration(calibration, detector):
-    return calibration.get("detectors", {}).get(str(detector), {})
+    return calibration.get("detectors", {}).get(str(detector + 1), {}) if detector in (0, 1) else {}
 
 
 def read_calibration(path=None):
@@ -508,8 +550,8 @@ def validate_calibration(data):
         raise ParseError("Calibration needs a nonempty caldb_version")
     if not isinstance(data.get("detectors", {}), dict):
         raise ParseError("Calibration detectors must be an object")
-    if set(data.get("detectors", {})) - {"0", "1"}:
-        raise ParseError("Calibration detector keys must be 0 or 1")
+    if set(data.get("detectors", {})) - {"1", "2"}:
+        raise ParseError("Calibration detector keys must be 1 (raw ID 0) or 2 (raw ID 1)")
     for detector, values in data.get("detectors", {}).items():
         if not isinstance(values, dict):
             raise ParseError(f"Detector {detector}: calibration must be an object")
@@ -541,7 +583,7 @@ def validate_calibration(data):
     return data
 
 
-# 8. FITS columns and metadata. ICD columns always precede diagnostics.
+# 8. FITS columns and metadata. Original raw values are preserved in L0.
 def column(name, values, form, unit=None, unsigned=False, null=None):
     options = dict(name=name, array=values, format=form)
     if unit:
@@ -562,23 +604,17 @@ def make_table(name, data, schema):
         for key, form, unit, unsigned in schema], name=name)
 
 
-TRACE_SCHEMA = [("SOURCE_ID", "1J", None, False), ("BYTE_OFFSET", "1K", "byte", False),
-                ("PKT_TIME", "1D", "s", False)]
+# Only the columns in ICD tables 6.2d, 6.2l and 6.2m belong in L1.
+# Extra decoded fields remain available from the original L0 bytes.
 HIST_SCHEMA = [("TIME", "1D", "s", False), ("PKT_CNT", "1I", None, False),
-               ("TIMEDEL", "1D", "s", False), ("COUNT", "29I", "count", True),
-               ("TIME_QUAL", "1I", None, False), ("DEADTIME", "1D", "s", False),
-               ("DEAD_TICKS", "1K", None, False), ("HIST_SEC", "1K", "s", False),
-               ("HIST_TICKS", "1K", None, False), ("BINMODE", "1B", None, False)] + TRACE_SCHEMA
+               ("TIMEDEL", "1D", "s", False), ("COUNT", "29I", "count", True)]
 CTIME_SCHEMA = [("TIME", "1D", "s", False), ("PKT_CNT", "1I", None, False),
-                ("TIMEDEL", "1D", "s", False), ("COUNT", "3J", "count", False),
-                ("COUNTER_RAW", "3I", None, True), ("COUNT_QUAL", "1I", None, False),
-                ("TIME_QUAL", "1I", None, False), ("SAMPLE", "1I", None, False)] + TRACE_SCHEMA
+                ("TIMEDEL", "1D", "s", False), ("COUNT", "3J", "count", False)]
+# 3J retains all unsigned 16-bit increments plus -1 (missing predecessor).
+# The column count/order is exactly the ICD's; this width exception is explicit.
 EVENT_SCHEMA = [("TIME", "1D", "s", False), ("PKT_CNT", "1I", None, False),
                 ("PHA", "1I", "chan", False), ("ENERGY", "1E", "keV", False),
-                ("DEADTIME", "1D", "s", False), ("TIME_QUAL", "1I", None, False),
-                ("RAW_ADC", "1I", None, True), ("DWT", "1K", "cycle", False),
-                ("TSU_TICKS", "1I", None, False), ("DEAD_TICKS", "1J", None, False),
-                ("FLAGS", "1B", None, False)] + TRACE_SCHEMA
+                ("DEADTIME", "1D", "s", False)]
 
 
 def set_headers(hdu, times, detector, obs_id, calibration, interval=0.0):
@@ -589,15 +625,19 @@ def set_headers(hdu, times, detector, obs_id, calibration, interval=0.0):
              SEQNUM=1, SEQPNUM=1, TIMESYS="TT", TIMEUNIT="s", MJDREFI=MJDREFI,
              MJDREFF=MJDREFF, TIMEREF="LOCAL", TASSIGN="SATELLITE", CLOCKAPP=False,
              DATE=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"))
-    h["DATLEVEL"] = ("L1", "Raw and calibrated columns in one product")
+    h["DATLEVEL"] = ("L1", "Unified L1; ICD science table columns")
     h["CALIBID"] = (calibration.get("calibration_id", "CUSTOM" if calibration else "NONE"),
                     "Calibration identifier; independent of CALDBVER")
-    h["DETNAM"] = f"BTO{detector}" if detector in (0, 1) else "BTO0,BTO1"
+    h["DETNAM"] = f"BTO{detector + 1}" if detector in (0, 1) else "BTO1,BTO2"
     detcal = detector_calibration(calibration, detector)
     if "energy" in detcal:
         h["ECSLOPE"] = (float(detcal["energy"][0]), "Energy slope in keV/ADU")
         h["ECOFFSET"] = (float(detcal["energy"][1]), "Energy intercept in keV")
         h["ECALNAME"] = detcal.get("energy_source", "CUSTOM")
+        if "energy_temperature_c" in detcal:
+            h["ECALTEMP"] = (float(detcal["energy_temperature_c"]), "Energy calibration temperature in C")
+        if "energy_reduced_chi2" in detcal:
+            h["ECALCHI2"] = (float(detcal["energy_reduced_chi2"]), "Supplied energy-fit reduced chi-square")
         if "energy_uncertainty" in detcal:
             h["ECSLPERR"] = (float(detcal["energy_uncertainty"][0]), "Supplied slope uncertainty in keV/ADU")
             h["ECOFFERR"] = (float(detcal["energy_uncertainty"][1]), "Supplied intercept uncertainty in keV")
@@ -617,17 +657,28 @@ def set_headers(hdu, times, detector, obs_id, calibration, interval=0.0):
         h["HDUCLAS1"] = "TEMPORALDATA"
         if "TIME" in hdu.columns.names:
             h.comments[f"TTYPE{hdu.columns.names.index('TIME') + 1}"] = "SI seconds since 2025-01-01 00:00:00 UTC"
-    h["HISTORY"] = "Archive ICD 2026-11-10; unified L1 requested by user 2026-11-12."
+    h["HISTORY"] = "Archive ICD 2026-11-10; user requested BTO1/BTO2 labels and unified L1."
     h["HISTORY"] = "Original L0 binaries and source offsets are mapped in manifest.json."
 
 
-def empty_gti(name="GTI"):
-    """Telemetry alone does not establish screened science good-time intervals."""
+def observation_gti(times, name="GTI", interval=0.0):
+    """Observation start/stop in MET, without claiming science screening.
+
+    Event bounds are the first/last finite event times. For binned data,
+    include the full nominal width of the first end-stamped bin. Missing
+    scientific times never acquire a GTI from packet transmission time.
+    """
+    finite = np.asarray(times)[np.isfinite(times)]
+    start = [float(finite.min() - interval)] if len(finite) else []
+    stop = [float(finite.max())] if len(finite) else []
     hdu = fits.BinTableHDU.from_columns([
-        column("START", [], "1D", "s"), column("STOP", [], "1D", "s")], name=name)
+        column("START", start, "1D", "s"), column("STOP", stop, "1D", "s")], name=name)
     hdu.header.update(HDUCLASS="OGIP", HDUCLAS1="GTI", HDUCLAS2="STANDARD",
-                      GTISTAT="NOT_SCREENED", OBSERVER="John Tomsick", DATAMODE="UNSCREENED")
-    hdu.header["COMMENT"] = "Empty GTI: apply observing-mode and quality screening downstream."
+                      GTISTAT="OBSERVATION" if len(finite) else "UNRESOLVED",
+                      OBSERVER="John Tomsick", DATAMODE="UNSCREENED")
+    hdu.header["COMMENT"] = "GTI gives the observation span in MET, not quality-screened intervals."
+    if not len(finite):
+        hdu.header["COMMENT"] = "No finite scientific TIME: observation bounds are unavailable."
     return hdu
 
 
@@ -646,11 +697,29 @@ def energy_bands(detector, modes, calibration):
     hdu = fits.BinTableHDU.from_columns([
         column("MINCHAN", lower, "1I", null=-1), column("MAXCHAN", upper, "1I", null=-1),
         column("E_MIN", e_min, "1E", "keV"), column("E_MAX", e_max, "1E", "keV")],
-        name=f"CSPEC_ENEBAND{detector}")
+        name=f"CSPEC_ENEBAND{detector + 1}")
     hdu.header.update(HDUCLASS="OGIP", HDUCLAS1="RESPONSE", HDUCLAS2="EBOUNDS",
                       BINTYPE=band.get("type", "UNKNOWN"),
                       CALSTAT="APPLIED" if np.all(np.isfinite(e_min)) else "UNAVAILABLE")
     return hdu
+
+
+def science_path(root, day, subdirectory, filename):
+    """The archive ICD's monthly/day tree, containing only BTO products."""
+    if day == "undated":
+        raise ParseError("Cannot write an ICD observation without a usable date")
+    month = day[:4] + "_" + day[4:6]
+    return root / "cosi" / "data" / "obs" / month / day / subdirectory / filename
+
+
+def source_ids(table):
+    return [int(value) for value in np.unique(table["SOURCE_ID"])]
+
+
+def retain_undated(skipped, kind, table):
+    """Keep undatable records in L0 without inventing a directory or date."""
+    skipped.append(dict(kind=kind, rows=len(table["TIME"]), source_ids=source_ids(table),
+                        reason="No usable observation date; original records retained in L0"))
 
 
 def write_fits(path, hdus):
@@ -672,20 +741,28 @@ def date_groups(times, fallback):
         yield str(day), np.flatnonzero(days == day)
 
 
-def write_histograms(root, packets, detector, calibration, products):
+def write_histograms(root, packets, detector, calibration, products, skipped):
     hist, lc = decode_histograms(packets)
     for day, ids in date_groups(hist["TIME"], hist["PKT_TIME"]):
         data = subset(hist, ids)
+        if day == "undated":
+            retain_undated(skipped, "spectral_lightcurve", data)
+            continue
         data = subset(data, time_order(data["TIME"]))
         lc_ids = (ids[:, None] * 10 + np.arange(10)[None, :]).ravel()
         ctime = subset(lc, lc_ids)
         ctime = subset(ctime, time_order(ctime["TIME"]))
-        spectrum = make_table(f"BTO{detector}_CSPEC", data, HIST_SCHEMA)
+        spectrum = make_table(f"BTO{detector + 1}_CSPEC", data, HIST_SCHEMA)
         bands = energy_bands(detector, np.unique(data["BINMODE"]), calibration)
-        lightcurve = make_table(f"BTO{detector}_CTIME", ctime, CTIME_SCHEMA)
-        hdus = [fits.PrimaryHDU(), spectrum, bands, lightcurve, empty_gti("BTO_GTI")]
+        lightcurve = make_table(f"BTO{detector + 1}_CTIME", ctime, CTIME_SCHEMA)
+        # The shared observation covers both sets of end-stamped bins.
+        coverage = np.concatenate((data["TIME"] - 1.0, data["TIME"],
+                                   ctime["TIME"] - 0.1, ctime["TIME"]))
+        hdus = [fits.PrimaryHDU(), spectrum, bands, lightcurve,
+                observation_gti(coverage, "BTO_GTI")]
         for hdu in hdus:
-            set_headers(hdu, data["TIME"], detector, day, calibration, interval=1.0)
+            set_headers(hdu, coverage, detector, day, calibration)
+        set_headers(spectrum, data["TIME"], detector, day, calibration, interval=1.0)
         # Restore extension classification after common metadata is installed.
         bands.header.update(HDUCLAS1="RESPONSE", HDUCLAS2="EBOUNDS")
         hdus[-1].header["HDUCLAS1"] = "GTI"
@@ -697,32 +774,32 @@ def write_histograms(root, packets, detector, calibration, products):
                                  CHAN1="ZERO_CROSSING", CHAN2="UPPER", CHAN3="SUPER_UPPER")
         lightcurve.header["COMMENT"] = "COUNT is minimum modulo increment; multiple counter wraps are unresolved."
         lightcurve.header["COMMENT"] = "No per-100ms deadtime is available. TIMEDEL is nominal 0.1 s."
-        lightcurve.header["COMMENT"] = "COUNT_QUAL=1: first counter difference is unavailable; COUNT=-1."
-        path = root / "L1" / day / "bto" / f"cs{day}bto{detector}_spec_lc.fits"
+        lightcurve.header["COMMENT"] = "COUNT=-1 where a preceding cumulative counter is unavailable."
+        path = science_path(root, day, "bto", f"cs{day}bto{detector + 1}_spec_lc.fits")
         write_fits(path, hdus)
-        products.append(dict(path=str(path.relative_to(root)), kind="spectral_lightcurve", detector=detector,
+        products.append(dict(path=str(path.relative_to(root)), kind="spectral_lightcurve", detector=detector + 1,
+                             source_ids=source_ids(data),
                              cspec_rows=len(ids), ctime_rows=len(ctime["TIME"]),
                              invalid_deadtime=int(np.sum(~np.isfinite(data["TIMEDEL"]))),
                              unknown_time=int(np.sum(~np.isfinite(data["TIME"])))))
 
 
-def write_housekeeping(root, packets, calibration, products):
+def write_housekeeping(root, packets, calibration, products, skipped):
     table = decode_housekeeping(packets, calibration)
     first = [("TIME", "1D", "s", False), ("BTO_MODE", "1B", None, False),
              ("UPTIME_TICKS", "1J", None, True), ("LAST_GRB_TIME", "1D", "s", False),
              ("LAST_GRB_ID", "1J", None, True), ("ZERO_CROSSING_COUNT", "1I", None, True),
              ("SUPPER_UPPER_COUNT", "1I", None, True)]
     first += [(name, "1E", unit, False) for name, unit in SENSORS]
-    extra = [("BTO_ID", "1B", None, False), ("PKT_CNT", "1I", None, False),
-             ("TIME_QUAL", "1I", None, False)]
-    used = {item[0] for item in first + extra + TRACE_SCHEMA}
-    extra += [(name, "1K", None, False) for name in table if name not in used]
     for day, ids in date_groups(table["TIME"], table["PKT_TIME"]):
         data = subset(table, ids)
+        if day == "undated":
+            retain_undated(skipped, "housekeeping", data)
+            continue
         data = subset(data, time_order(data["TIME"]))
-        # Keep the literal draft EXTNAME. BTO_ID identifies the detector in
-        # this one combined housekeeping extension; the name is not a filter.
-        hdu = make_table("BTO0_HSK", data, first + extra + TRACE_SCHEMA)
+        # One combined housekeeping extension, with the requested BTO1 label.
+        # Original source detector IDs remain available in L0.
+        hdu = make_table("BTO1_HSK", data, first)
         hdus = [fits.PrimaryHDU(), hdu]
         for item in hdus:
             set_headers(item, data["TIME"], None, day, calibration)
@@ -737,16 +814,16 @@ def write_housekeeping(root, packets, calibration, products):
                 if name in coefficients:
                     slope, intercept = coefficients[name]
                     hdu.header["HISTORY"] = (
-                        f"BTO{det} {name} = {slope:g}*ADC {intercept:+g} {unit}")
-        hdu.header["COMMENT"] = "BTO0_HSK is the ICD table name; select rows using BTO_ID."
-        hdu.header["COMMENT"] = "Calibrated sensors and their original *_ADC columns are stored together."
+                        f"BTO{det + 1} {name} = {slope:g}*ADC {intercept:+g} {unit}")
+        hdu.header["COMMENT"] = "Combined BTO1/BTO2 housekeeping; original detector IDs and ADCs are in L0."
         hdu.header["COMMENT"] = "Missing sensor coefficients produce NaN; see CALSTAT and manifest.json."
-        path = root / "L1" / day / "auxil" / f"cs{day}bto_gen.hk.fits"
+        path = science_path(root, day, "auxil", f"cs{day}bto_gen_hk.fits")
         write_fits(path, hdus)
-        products.append(dict(path=str(path.relative_to(root)), kind="housekeeping", rows=len(ids)))
+        products.append(dict(path=str(path.relative_to(root)), kind="housekeeping", rows=len(ids),
+                             source_ids=source_ids(data)))
 
 
-def write_events(root, packets, detector, calibration, products):
+def write_events(root, packets, detector, calibration, products, skipped, registry):
     data, triggers, diagnostics = decode_events(packets)
     detcal = detector_calibration(calibration, detector)
     if "energy" in detcal:
@@ -762,24 +839,36 @@ def write_events(root, packets, detector, calibration, products):
         route_time = float(valid.min()) if len(valid) else float(fallback.min()) if len(fallback) else np.nan
         groups.append((route_time, int(group), ids))
     groups.sort(key=lambda item: item[0] if np.isfinite(item[0]) else np.inf)
-    daily_number = Counter()
+    known, used = registry
     for route_time, group, ids in groups:
         day = date_key(route_time)
-        daily_number[day] += 1
-        if daily_number[day] > 999:
-            raise ParseError(f"More than 999 event groups on {day}; ICD filename field exhausted")
-        number = daily_number[day]
+        if day == "undated":
+            retain_undated(skipped, "events", subset(data, ids))
+            continue
+        # Keep observation names stable when a later run selects other folders.
+        # Existing observations keep their number; new ones use a free number.
+        key = f"{day}:{int(triggers[group])}:{route_time.hex()}"
+        if not np.any(np.isfinite(data["TIME"][ids])):
+            key += f':{int(data["SOURCE_ID"][ids[0]])}:{int(data["BYTE_OFFSET"][ids[0]])}'
+        if key in known:
+            number = known[key]
+        else:
+            number = next((i for i in range(1, 1000) if i not in used[day]), None)
+            if number is None:
+                raise ParseError(f"More than 999 event groups on {day}; filename field exhausted")
+            known[key] = number
+            used[day].add(number)
         obs_id = f"{day}{number:03d}t"
         rows = subset(data, ids)
         rows = subset(rows, time_order(rows["TIME"]))
         hdu = make_table("BTO_EVENT", rows, EVENT_SCHEMA)
-        hdus = [fits.PrimaryHDU(), hdu, empty_gti()]
+        hdus = [fits.PrimaryHDU(), hdu, observation_gti(rows["TIME"])]
         for item in hdus:
             set_headers(item, rows["TIME"], detector, obs_id, calibration)
             item.header["GRB_ID"] = (int(triggers[group]), "Onboard START ID; -1 if START is absent")
         hdu.header.update(HDUCLAS1="EVENT", HDUCLAS2="ALL", DEADAPP=False,
                           DTTICK=DEADTIME_TICK, DWTRES=DWT_QUANTUM / DWT_HZ,
-                          TIMEMETH="HEARTBEAT_PAIRS", CALSTAT="APPLIED" if "energy" in detcal else "UNAVAILABLE",
+                          TIMEMETH="ABSOLUTE_BRACKETS", CALSTAT="APPLIED" if "energy" in detcal else "UNAVAILABLE",
                           NTIMED=int(np.sum(np.isfinite(rows["TIME"]))),
                           NUNTIMED=int(np.sum(~np.isfinite(rows["TIME"]))),
                           ROUTETIM="EVENT" if np.any(np.isfinite(rows["TIME"])) else "PACKET")
@@ -787,20 +876,22 @@ def write_events(root, packets, detector, calibration, products):
         if "energy" in detcal:
             slope, intercept = detcal["energy"]
             hdu.header.update(E_MIN=float(intercept), E_MAX=float(4095 * slope + intercept))
-        hdu.header["COMMENT"] = "TIME_QUAL bits: 1 clock,2 gap,4 no anchor,8 marker,16 DWT,32 ambiguous record."
-        hdu.header["COMMENT"] = "PKT_TIME is transmission time and is never a substitute for event TIME."
+        hdu.header["COMMENT"] = "Original event words, flags and raw clocks are preserved in L0."
+        hdu.header["COMMENT"] = "TIME is bracketed by absolute clocks; packet transmission time is not used."
         hdu.header["COMMENT"] = "FLAGS bits 0/1/2/3: pseudo/lower/upper/super-upper. PHA is unsigned 12-bit ADC."
         date_part = day[2:] if day != "undated" else day
-        filename = f"cs{date_part}{number:03d}tbto{detector}_evt.fits"
-        path = root / "L1" / day / "bto" / filename
+        filename = f"cs{date_part}{number:03d}tbto{detector + 1}_evt.fits"
+        path = science_path(root, day, "bto", filename)
         write_fits(path, hdus)
-        products.append(dict(path=str(path.relative_to(root)), kind="events", detector=detector,
+        products.append(dict(path=str(path.relative_to(root)), kind="events", detector=detector + 1,
+                             source_ids=source_ids(rows),
+                             event_key=key,
                              rows=len(ids), onboard_trigger_id=int(triggers[group]),
                              timed=hdu.header["NTIMED"], untimed=hdu.header["NUNTIMED"]))
     return diagnostics
 
 
-# 9. Batch execution. A run replaces a whole managed archive; it never appends.
+# 9. Batch execution. Replace matching files; preserve all other archive files.
 def sha256_file(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -810,93 +901,243 @@ def sha256_file(path):
 
 
 def is_excluded_path(path, output):
-    """Exclude the target output archive and any temporary staging directories."""
     stage_prefix = f".{output.name}-building-"
-    for parent in (path, *path.parents):
-        if parent == output or (parent.parent == output.parent and parent.name.startswith(stage_prefix)):
-            return True
-    return False
+    return any(parent == output or
+               (parent.parent == output.parent and parent.name.startswith(stage_prefix))
+               for parent in (path, *path.parents))
 
 
-def collect_inputs(targets, output, recursive=False):
+def is_managed_archive(path):
+    manifest = path / "manifest.json"
+    if not manifest.is_file():
+        return False
+    try:
+        return json.loads(manifest.read_text()).get("archive_format") in (
+            ARCHIVE_FORMAT, *PREVIOUS_ARCHIVE_FORMATS)
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def collect_inputs(targets, output, recursive=True):
+    """Accept several files/folders or one parent folder; exclude output archives."""
+    output = Path(output).expanduser().resolve()
     files = set()
     for target in targets:
         path = Path(target).expanduser().resolve()
+        if is_excluded_path(path, output) or (path.is_dir() and is_managed_archive(path)):
+            raise ParseError(f"An output archive cannot be used as an input: {path}")
         if path.is_file():
             if path.suffix.lower() != ".bin":
                 raise ParseError(f"Expected a .bin file: {path}")
             files.add(path)
         elif path.is_dir():
-            candidates = path.rglob("*.bin") if recursive else path.glob("*.bin")
-            files.update(p.resolve() for p in candidates if not is_excluded_path(p.resolve(), output))
+            if recursive:
+                for directory, dirs, names in os.walk(path, followlinks=False):
+                    base = Path(directory)
+                    dirs[:] = [name for name in dirs
+                               if not is_excluded_path((base / name).resolve(), output)
+                               and not is_managed_archive(base / name)]
+                    files.update((base / name).resolve() for name in names
+                                 if Path(name).suffix.lower() == ".bin"
+                                 and not is_excluded_path((base / name).resolve(), output))
+            else:
+                files.update(p.resolve() for p in path.iterdir()
+                             if p.is_file() and p.suffix.lower() == ".bin"
+                             and not is_excluded_path(p.resolve(), output))
         else:
             raise ParseError(f"Input does not exist: {path}")
     if not files:
         raise ParseError("No .bin files found")
-    if any(is_excluded_path(p, output) for p in files):
-        raise ParseError("Input files must be outside the output archive")
     return sorted(files)
 
 
-def build_archive(paths, output, *, overwrite=False, framing="auto", checksum="absent",
+def input_time_key(path, framing, checksum):
+    """Folder names do not determine telemetry order across input captures."""
+    for packet in read_packets(path, framing=framing, checksum=checksum):
+        if packet.apid in SCIENCE_APIDS and np.isfinite(packet.time):
+            return packet.time, path.name, str(path)
+    return float("inf"), path.name, str(path)
+
+
+def archive_member(root, relative):
+    path = Path(relative)
+    if path.is_absolute() or ".." in path.parts:
+        raise ParseError(f"Invalid relative archive path: {relative}")
+    return root / path
+
+
+def event_registry(output, detector, old_products):
+    """Reserve existing filenames and recover observation identities on reruns."""
+    known, used = {}, defaultdict(set)
+    metadata = {p["path"]: p for p in old_products if p.get("kind") == "events"}
+    pattern = re.compile(r"cs\d{6}(\d{3})tbto" + str(detector + 1) + r"_evt\.fits")
+    for path in (output / "cosi/data/obs").glob(f"*/*/bto/*tbto{detector + 1}_evt.fits"):
+        match = pattern.fullmatch(path.name)
+        if match is None:
+            continue
+        day, number = path.parent.parent.name, int(match.group(1))
+        used[day].add(number)
+        entry = metadata.get(str(path.relative_to(output)), {})
+        if "event_key" in entry:
+            known[entry["event_key"]] = number
+        else:
+            # Compatibility with existing v5 products, which lacked event_key.
+            with fits.open(path) as hdus:
+                header = hdus[0].header
+                if "TSTART" in header and "GRB_ID" in header:
+                    key = f'{day}:{header["GRB_ID"]}:{float(header["TSTART"]).hex()}'
+                    known[key] = number
+                elif "DIAGFILE" in header and "GRB_ID" in header:
+                    # Read an existing v5 companion only to preserve the name
+                    # of an entirely untimed observation. No companion is written.
+                    companion = archive_member(output, header["DIAGFILE"])
+                    if companion.is_file():
+                        with np.load(companion, allow_pickle=False) as raw:
+                            packet_time = raw["EVENT__PKT_TIME"]
+                            finite = packet_time[np.isfinite(packet_time)]
+                            if len(finite):
+                                key = f'{day}:{header["GRB_ID"]}:{float(finite.min()).hex()}'
+                                key += f':{int(raw["EVENT__SOURCE_ID"][0])}:{int(raw["EVENT__BYTE_OFFSET"][0])}'
+                                known[key] = number
+    return known, used
+
+
+def install_files(stage, output, clobber):
+    """Preflight all collisions, then install per file with rollback on failure."""
+    if not output.exists():
+        stage.rename(output)
+        return
+    if not output.is_dir():
+        raise ParseError("Output must be a directory")
+    plan = []
+    for source in sorted(stage.rglob("*"), key=lambda p: (p.name == "manifest.json", str(p))):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(stage)
+        target = output / relative
+        for part in (target, *target.parents):
+            if part == output:
+                break
+            if part.is_symlink():
+                raise ParseError(f"Refusing to replace through a symbolic link: {part}")
+        if target.exists():
+            if not target.is_file():
+                raise ParseError(f"Output file conflicts with a directory: {target}")
+            if relative.parts[0] == "L0" and sha256_file(source) == sha256_file(target):
+                continue  # Identical original bytes need no rewrite, including clobber=no.
+            if not clobber and relative != Path("manifest.json"):
+                raise ParseError(f"Output file exists and clobber=no: {target}")
+        plan.append((source, target, relative))
+    installed = []
+    try:
+        for source, target, relative in plan:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            backup = None
+            if target.exists():
+                backup = stage / "_previous" / relative
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(target, backup)
+            installed.append((target, backup))
+            os.replace(source, target)
+    except Exception:
+        for target, backup in reversed(installed):
+            if target.exists():
+                target.unlink()
+            if backup is not None:
+                os.replace(backup, target)
+        raise
+    shutil.rmtree(stage)
+
+
+def build_archive(paths, output, *, clobber=True, overwrite=None, framing="auto", checksum="absent",
                   calibration=None, level="l1"):
     if level not in ("l0", "l1", "all"):
         raise ParseError("Level must be l0, l1 or all; only unified L1 is supported")
+    if overwrite is not None:  # Compatibility with callers of the older Python API.
+        clobber = bool(overwrite)
     level = "l1" if level == "all" else level
     calibration = read_calibration() if calibration is None else validate_calibration(calibration)
     if Path(output).is_symlink():
         raise ParseError("Output directory must not be a symbolic link")
     output = Path(output).resolve()
-    if any(is_excluded_path(Path(p).resolve(), output) for p in paths):
-        raise ParseError("Input files must be outside the output archive")
-    if output.exists():
-        manifest = output / "manifest.json"
-        if not overwrite:
-            raise ParseError(f"Output exists: {output}. Use --overwrite to rebuild it.")
-        if (not manifest.is_file() or json.loads(manifest.read_text()).get("archive_format")
-                not in (ARCHIVE_FORMAT, PREVIOUS_ARCHIVE_FORMAT)):
-            raise ParseError("--overwrite only replaces an archive created by this parser")
+    paths = sorted({Path(p).resolve() for p in paths})
+    if not paths or any(is_excluded_path(p, output) for p in paths):
+        raise ParseError("Provide input binaries outside the output archive")
+    old = {}
+    old_manifest = output / "manifest.json"
+    if old_manifest.exists():
+        if not is_managed_archive(output):
+            raise ParseError("Existing manifest.json does not describe a BTO parser archive")
+        old = json.loads(old_manifest.read_text())
+    old_inputs = [dict(entry) for entry in old.get("inputs", [])]
+    old_products = old.get("products", [])
+    for entry in old_inputs:
+        archive_member(output, entry["archived_path"])
+    for entry in old_products:
+        archive_member(output, entry["path"])
+    paths.sort(key=lambda p: input_time_key(p, framing, checksum))
     output.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{output.name}-building-", dir=output.parent))
-    report = dict(archive_format=ARCHIVE_FORMAT, parser_version=VERSION, inputs=[], products=[],
-                  duplicates_skipped=[], packet_counts={}, sequence_gaps={}, photon_diagnostics={})
-    report["settings"] = dict(framing=framing, checksum=checksum, level=level,
+    report = dict(archive_format=ARCHIVE_FORMAT, parser_version=VERSION, inputs=old_inputs, products=[],
+                  duplicates_skipped=[], packet_counts={}, sequence_gaps={}, photon_diagnostics={},
+                  skipped_l1=[], selected_source_ids=[])
+    report["settings"] = dict(framing=framing, checksum=checksum, level=level, clobber=bool(clobber),
                               deadtime_tick_seconds=DEADTIME_TICK, pps_hz=PPS_HZ, dwt_hz=DWT_HZ,
                               maximum_anchor_span_seconds=MAX_ANCHOR_SPAN,
                               clock_tolerance_ppm=CLOCK_TOLERANCE * 1e6)
     report["limitations"] = [
-        "FITS GTIs are empty until science screening is performed.",
+        "GTIs contain the observation start/stop in MET, not quality-screened intervals.",
+        "A product with no finite scientific time has an unresolved, empty GTI.",
+        "Records with no usable observation date stay in L0 and are listed under skipped_l1.",
         "CTIME uses nominal 0.1 s widths; per-bin deadtime is not in the packets.",
         "CTIME counts are minimum modulo increments; multiple wraps cannot be recovered.",
         "TEMP_EXT is uncalibrated unless its coefficients are explicitly supplied.",
         "Histogram channel/energy boundaries require the firmware's 30 ADC bin edges.",
-        "Supplied HK unit labels conflict; output uses C, V, mA as in the lower sheet and ICD.",
-        "Energy-fit temperature, validity range and coefficient covariance were not supplied.",
-        "Only current three-record D7 heartbeats are timed; unsupported markers remain flagged.",
+        "HK units follow the ICD: C, V, mA.",
+        "The two energy fits are at 17 C; no temperature correction, validity range or covariance was supplied.",
+        "Only events bounded by consistent absolute clock markers are timed; unbounded edges remain NaN.",
+        "CTIME COUNT uses 3J rather than 3I to retain uint16 values plus an unknown-count sentinel.",
+        "Matching products are replaced from the selected inputs, not appended; select all inputs needed for each product.",
+        "Packet counts and photon diagnostics describe this run; inputs and products also include retained older entries.",
     ]
+    catalog = {entry["source_id"]: entry for entry in old_inputs}
+    next_id = max(catalog, default=-1) + 1
+    selected = set()
     streams = defaultdict(list)
-    previous = {}
-    seen_hashes = {}
+    previous, seen_hashes = {}, {}
     counts, gaps = Counter(), Counter()
     try:
         for path in paths:
             digest = sha256_file(path)
-            source = len(report["inputs"])
-            # A separate source directory preserves original names, even on collisions.
-            relative = Path("L0") / f"{source:04d}" / path.name
-            copied = stage / relative
+            # Reuse an unchanged source's identity, including pre-v6 manifests.
+            matches = [entry for entry in old_inputs
+                       if entry["source_id"] not in selected and entry["sha256"] == digest
+                       and entry["name"] == path.name
+                       and entry.get("source_path", str(path)) == str(path)]
+            if matches:
+                entry = matches[0]
+                source = entry["source_id"]
+            else:
+                while (output / "L0" / f"{next_id:04d}").exists():
+                    next_id += 1
+                source, next_id = next_id, next_id + 1
+                entry = dict(source_id=source, name=path.name, sha256=digest,
+                             archived_path=str(Path("L0") / f"{source:04d}" / path.name))
+                report["inputs"].append(entry)
+                catalog[source] = entry
+            selected.add(source)
+            report["selected_source_ids"].append(source)
+            entry.update(source_path=str(path), bytes=path.stat().st_size)
+            entry.pop("duplicate_of", None)
+            copied = archive_member(stage, entry["archived_path"])
             copied.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, copied)
             if sha256_file(copied) != digest:
                 raise ParseError(f"Input changed while being copied: {path}")
-            report["inputs"].append(dict(source_id=source, name=path.name, sha256=digest,
-                                         bytes=copied.stat().st_size, archived_path=str(relative)))
             if digest in seen_hashes:
-                # Archive every original file; decode identical bytes only once into L1.
                 original = seen_hashes[digest]
-                report["inputs"][-1].update(duplicate_of=original,
-                                            packets=report["inputs"][original]["packets"])
-                report["duplicates_skipped"].append(str(path))  # L1 decoding only
+                entry.update(duplicate_of=original, packets=catalog[original]["packets"])
+                report["duplicates_skipped"].append(str(path))
                 continue
             seen_hashes[digest] = source
             print(f"Reading {path.name}", flush=True)
@@ -906,51 +1147,47 @@ def build_archive(paths, output, *, overwrite=False, framing="auto", checksum="a
                 key = f"0x{packet.apid:03X}"
                 counts[key] += 1
                 if packet.apid not in SCIENCE_APIDS:
-                    continue             # Exact bytes retained in L0; no invented FITS schema
+                    continue
                 identity = packet.apid, packet.detector
                 if identity in previous:
                     packet.gap = packet.sequence != (previous[identity] + 1) % 16384
                 previous[identity] = packet.sequence
                 if packet.gap:
-                    gaps[f"{key}/BTO{packet.detector}"] += 1
+                    gaps[f"{key}/BTO{packet.detector + 1}"] += 1
                 if level != "l0":
                     streams[identity].append(packet)
             if not source_packets:
                 raise ParseError(f"Empty telemetry file: {path}")
-            report["inputs"][-1]["packets"] = source_packets
+            entry["packets"] = source_packets
         report["packet_counts"], report["sequence_gaps"] = dict(counts), dict(gaps)
         for detector in (0, 1):
             packets = streams.pop((0xD6, detector), [])
             if packets:
-                print(f"Writing BTO{detector} spectral/lightcurve files", flush=True)
-                write_histograms(stage, packets, detector, calibration, report["products"])
+                print(f"Writing BTO{detector + 1} spectral/lightcurve files", flush=True)
+                write_histograms(stage, packets, detector, calibration, report["products"], report["skipped_l1"])
         hk = streams.pop((0xD8, 0), []) + streams.pop((0xD8, 1), [])
         if hk:
-            print("Writing housekeeping files", flush=True)
-            write_housekeeping(stage, hk, calibration, report["products"])
+            print("Writing BTO1/BTO2 housekeeping files", flush=True)
+            write_housekeeping(stage, hk, calibration, report["products"], report["skipped_l1"])
         del hk
         for detector in (0, 1):
             packets = streams.pop((0xD7, detector), [])
             if packets:
-                print(f"Writing BTO{detector} event files", flush=True)
-                report["photon_diagnostics"][str(detector)] = write_events(
-                    stage, packets, detector, calibration, report["products"])
+                print(f"Writing BTO{detector + 1} event files", flush=True)
+                report["photon_diagnostics"][str(detector + 1)] = write_events(
+                    stage, packets, detector, calibration, report["products"], report["skipped_l1"],
+                    event_registry(output, detector, old_products))
         report["calibration"] = calibration
+        report["written_products"] = [entry["path"] for entry in report["products"]]
+        all_products = {entry["path"]: entry for entry in old_products
+                        if archive_member(output, entry["path"]).is_file()}
+        all_products.update({entry["path"]: entry for entry in report["products"]})
+        report["products"] = list(all_products.values())
+        report["retained_products"] = len(all_products) - len(report["written_products"])
         (stage / "manifest.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
-        backup = None
-        if output.exists():
-            backup = stage.parent / (stage.name + "-previous")
-            output.rename(backup)
-        try:
-            stage.rename(output)
-        except Exception:
-            if backup is not None:
-                backup.rename(output)
-            raise
-        if backup is not None:
-            shutil.rmtree(backup)
+        install_files(stage, output, clobber)
     except Exception:
-        print(f"Run failed. Partial files are retained at {stage}; they are not a completed archive.", file=sys.stderr)
+        print(f"Run failed. Existing files were preserved; staged files are at {stage}.", file=sys.stderr)
         raise
     return report
 
@@ -958,16 +1195,25 @@ def build_archive(paths, output, *, overwrite=False, framing="auto", checksum="a
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("files", nargs="*", help="Binary files or directories")
-    parser.add_argument("--input", nargs="+", default=[], help="Binary files or directories (alternative syntax)")
+    parser.add_argument("--input", nargs="+", action="append", default=[],
+                        help="One or more files/folders; may be repeated")
     parser.add_argument("-o", "--output", "--output-dir", dest="output_dir",
                         default="BTO_FITS_Archive", help="Archive directory")
-    parser.add_argument("--recursive", action="store_true", help="Include .bin files in input subdirectories")
-    parser.add_argument("--overwrite", action="store_true", help="Rebuild a managed archive from all selected inputs")
+    parser.add_argument("--recursive", action="store_true", default=True,
+                        help="Include input subfolders (default)")
+    parser.add_argument("--no-recursive", action="store_false", dest="recursive",
+                        help="Read only the named folders, without subfolders")
+    parser.add_argument("--clobber", choices=["yes", "no"], default="yes",
+                        help="Overwrite matching output files (default: yes); preserve other files")
+    parser.add_argument("--overwrite", dest="clobber", action="store_const", const="yes",
+                        help="Alias for --clobber yes")
+    parser.add_argument("--no-clobber", dest="clobber", action="store_const", const="no",
+                        help="Alias for --clobber no")
     parser.add_argument("--framing", choices=["auto", "ccsds", "sync"], default="auto", help="auto detects optional EB90")
     parser.add_argument("--checksum", choices=["absent", "required"], default="absent", help="External BTO XOR16; absent in samples")
     parser.add_argument("--calibration", type=Path, help="JSON replacing the supplied energy/housekeeping defaults")
     parser.add_argument("--level", choices=["l0", "l1", "all"], default="l1",
-                        help="l0 preserves binaries; l1/all also writes raw+calibrated FITS")
+                        help="l0 preserves binaries; l1/all also writes ICD L1 FITS")
     parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args(argv)
     try:
@@ -975,19 +1221,22 @@ def main(argv=None):
         if output_arg.is_symlink():
             raise ParseError("Output directory must not be a symbolic link")
         output = output_arg.resolve()
-        targets = args.files + args.input
+        targets = args.files + [item for group in args.input for item in group]
         if not targets:
             parser.error("provide --input or positional .bin files")
         paths = collect_inputs(targets, output, args.recursive)
-        report = build_archive(paths, output, overwrite=args.overwrite, framing=args.framing,
+        report = build_archive(paths, output, clobber=args.clobber == "yes", framing=args.framing,
                                checksum=args.checksum, calibration=read_calibration(args.calibration), level=args.level)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    print(f"Wrote {len(report['products'])} FITS files to {output}")
+    print(f"Wrote {len(report['written_products'])} FITS files to {output}; "
+          f"preserved {report['retained_products']} other indexed products")
     for detector, item in report["photon_diagnostics"].items():
         print(f"BTO{detector}: {item['events']:,} events; {item['timed_events']:,} with validated relative clock timing")
     print("See manifest.json for input hashes, packet counts, timing diagnostics and limitations.")
+    if report["skipped_l1"]:
+        print(f"Retained {sum(x['rows'] for x in report['skipped_l1'])} undated records in L0.")
     return 0
 
 
